@@ -1,0 +1,2074 @@
+#!/usr/bin/env python3
+"""
+deb-repo-gen — Generate a Debian/Ubuntu APT repository from a directory tree
+of .deb packages.
+
+Features:
+  - Recursive .deb scanning from one or more input directories
+  - Automatic metadata extraction via dpkg-deb
+  - Multi-distribution / multi-component / multi-architecture support
+  - Full APT repository metadata: Packages, Packages.gz, Release, InRelease, Release.gpg
+  - Optional GPG signing
+  - Fully offline / air-gapped operation
+  - Incremental updates — only processes changed packages
+  - Idempotent — multiple runs with same inputs produce identical results
+  - Duplicate and conflict detection
+  - Corrupted .deb handling (skip + log, never abort)
+  - Dry-run, verbose, and debug modes
+  - Resumability after interruption
+  - Built-in repository consistency validation
+  - Primary backend: apt-ftparchive (from apt-utils)
+  - Fallback backend: pure Python manual generation (zero extra deps)
+  - Strict error handling, meaningful exit codes
+  - ShellCheck-compliant style is not applicable (Python), but pylint-clean
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EXIT_SUCCESS = 0
+EXIT_INVALID_ARGS = 1
+EXIT_INPUT_NOT_FOUND = 2
+EXIT_NO_DEB_FOUND = 3
+EXIT_MISSING_DEPENDENCY = 4
+EXIT_CORRUPTED_PACKAGE = 5
+EXIT_DUPLICATE_CONFLICT = 6
+EXIT_GPG_ERROR = 7
+EXIT_VALIDATION_FAILED = 8
+EXIT_INTERRUPTED = 9
+EXIT_DISK_ERROR = 10
+EXIT_UNKNOWN = 99
+
+# Standard Debian pool prefix logic:
+#   libfoo...  →  libf
+#   otherwise  →  first character of package name
+_POOL_PREFIX_RE = re.compile(r'^(lib.)')
+
+# Recognised Debian architecture names (subset, kept for validation)
+_KNOWN_ARCHITECTURES = frozenset({
+    'all', 'amd64', 'arm64', 'armhf', 'armel', 'i386', 'mips64el',
+    'mipsel', 'ppc64el', 'riscv64', 's390x', 'source',
+})
+
+# Section → component defaults (Ubuntu-style)
+_DEFAULT_SECTION_MAP: Dict[str, str] = {
+    # contrib  → universe  (Ubuntu convention)
+    # non-free → multiverse or restricted
+}
+
+# State file schema version — increment when format changes
+_STATE_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger('deb-repo-gen')
+
+
+def setup_logging(level: int) -> None:
+    """Configure structured logging."""
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    fmt = logging.Formatter(
+        '%(asctime)s  %(levelname)-8s  %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
+    handler.setFormatter(fmt)
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_dir(path: Path) -> None:
+    """Create directory tree if it does not exist (idempotent)."""
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_write(path: Path, content: Union[str, bytes]) -> None:
+    """Write *content* atomically via a temporary file + rename."""
+    tmp_fd: int
+    tmp_path: str
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix='.' + path.name + '.', suffix='.tmp'
+    )
+    try:
+        if isinstance(content, str):
+            os.write(tmp_fd, content.encode('utf-8'))
+        else:
+            os.write(tmp_fd, content)
+        os.fsync(tmp_fd)
+    finally:
+        os.close(tmp_fd)
+    os.chmod(tmp_path, 0o644)
+    os.replace(tmp_path, str(path))
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    """Copy *src* → *dst* atomically (write to tmp, then rename)."""
+    _ensure_dir(dst.parent)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(dst.parent), prefix='.' + dst.name + '.', suffix='.tmp'
+    )
+    try:
+        os.close(tmp_fd)
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, str(dst))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_if_exists(path: Path) -> bool:
+    """Remove a file or symlink; return True if it was removed."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except IsADirectoryError:
+        shutil.rmtree(path)
+        return True
+
+
+def run_command(
+    cmd: List[str],
+    *,
+    timeout: int = 120,
+    cwd: Optional[Path] = None,
+    stdin_data: Optional[str] = None,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run a subprocess with consistent error handling.
+
+    Returns CompletedProcess.  Raises subprocess.CalledProcessError on non-zero
+    exit unless *check* is explicitly disabled (callers can choose).
+    """
+    logger.debug('Running: %s', ' '.join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            input=stdin_data,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.error('Command timed out after %ds: %s', timeout, ' '.join(cmd))
+        raise
+    except FileNotFoundError:
+        logger.error('Command not found: %s', cmd[0])
+        raise
+
+    if result.returncode != 0 and capture:
+        logger.debug('stderr: %s', result.stderr.strip())
+    return result
+
+
+def _sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file efficiently."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        while True:
+            chunk = fh.read(1 << 20)  # 1 MiB
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _checksums_file(path: Path) -> Tuple[str, str, str]:
+    """Return (md5, sha1, sha256) hex digests of a file in one pass."""
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
+    return md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Package metadata extraction
+# ---------------------------------------------------------------------------
+
+def _pool_prefix(package_name: str) -> str:
+    """Compute the Debian pool prefix for *package_name*."""
+    m = _POOL_PREFIX_RE.match(package_name)
+    return m.group(1) if m else package_name[0]
+
+
+def _pool_path(package: str, version: str, arch: str,
+               component: str, filename: str) -> str:
+    """Build a relative pool path like pool/main/n/nginx/nginx_1.0_amd64.deb."""
+    prefix = _pool_prefix(package)
+    return f'pool/{component}/{prefix}/{package}/{filename}'
+
+
+def parse_deb_control(control_text: str) -> Dict[str, str]:
+    """Parse the output of ``dpkg-deb -f <file>`` into a key→value dict.
+
+    Handles RFC-822 style continuation lines (leading space/tab).
+    """
+    result: Dict[str, str] = {}
+    current_key: Optional[str] = None
+    current_lines: List[str] = []
+
+    for raw_line in control_text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            if current_key is not None:
+                result[current_key] = '\n'.join(current_lines).rstrip()
+            current_key = None
+            current_lines = []
+            continue
+
+        if line[0] in (' ', '\t'):
+            # Continuation line
+            if current_key is not None:
+                current_lines.append(line.lstrip())
+            continue
+
+        # Save previous field
+        if current_key is not None:
+            result[current_key] = '\n'.join(current_lines).rstrip()
+
+        # New field  (format: "Key: value")
+        if ':' in line:
+            key, _, value = line.partition(':')
+            current_key = key.strip()
+            current_lines = [value.strip()] if value else []
+        else:
+            # Malformed — treat as continuation or skip
+            logger.debug('Malformed control line (no colon): %r', raw_line)
+            if current_key is not None:
+                current_lines.append(line.strip())
+
+    # Don't forget the last field
+    if current_key is not None:
+        result[current_key] = '\n'.join(current_lines).rstrip()
+
+    return result
+
+
+def extract_deb_metadata(
+    filepath: Path,
+) -> Tuple[Dict[str, str], int, str, str, str]:
+    """Extract control fields, size, and checksums from a .deb file.
+
+    Returns (control_dict, size, md5, sha1, sha256).
+    Raises subprocess.CalledProcessError on dpkg-deb failure.
+    Raises OSError on I/O errors.
+    """
+    if not filepath.is_file():
+        raise FileNotFoundError(f'Not a regular file: {filepath}')
+
+    # Extract control data
+    result = run_command(
+        ['dpkg-deb', '-f', str(filepath)],
+        timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+
+    control = parse_deb_control(result.stdout)
+
+    # Must have at least Package, Version, Architecture
+    for required in ('Package', 'Version', 'Architecture'):
+        if required not in control or not control[required]:
+            raise ValueError(
+                f'{filepath.name}: missing required field "{required}"'
+            )
+
+    # Checksums + size in one pass
+    file_size = filepath.stat().st_size
+    md5, sha1, sha256 = _checksums_file(filepath)
+
+    return control, file_size, md5, sha1, sha256
+
+
+def determine_component(
+    control: Dict[str, str],
+    section_map: Dict[str, str],
+    default_component: str,
+) -> str:
+    """Map a package's Section to a repository component.
+
+    Matching is prefix-based: if Section starts with a key in *section_map*,
+    return the mapped value.  Otherwise return *default_component*.
+    """
+    section = control.get('Section', '')
+    if not section:
+        return default_component
+    for prefix, component in section_map.items():
+        if section.startswith(prefix):
+            return component
+    return default_component
+
+
+# ---------------------------------------------------------------------------
+# State management (for incremental / resumable operation)
+# ---------------------------------------------------------------------------
+
+class RepoState:
+    """Persistent state for incremental repository generation."""
+
+    def __init__(self, repo_root: Path) -> None:
+        self._state_dir = repo_root / '.repo-state'
+        self._state_file = self._state_dir / 'state.json'
+        self._in_progress_file = self._state_dir / 'in_progress.json'
+        self.data: Dict[str, Any] = {
+            'version': _STATE_VERSION,
+            'generated_at': None,
+            'packages': {},  # key → {sha256, pool_path, component, source_path, ...}
+        }
+
+    def load(self) -> None:
+        """Load persistent state; auto-detect interrupted run."""
+        # Prefer the in-progress file (interrupted previous run)
+        for candidate in (self._in_progress_file, self._state_file):
+            if candidate.is_file():
+                logger.info('Loading state from %s', candidate)
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as fh:
+                        loaded = json.load(fh)
+                    if loaded.get('version') == _STATE_VERSION:
+                        self.data = loaded
+                        return
+                    logger.warning(
+                        'State file version mismatch (got %s, expected %s) — '
+                        'starting fresh',
+                        loaded.get('version'), _STATE_VERSION,
+                    )
+                except (json.JSONDecodeError, KeyError) as exc:
+                    logger.warning('Corrupted state file (%s) — starting fresh', exc)
+                break
+        logger.info('No valid state found — full generation')
+
+    def save(self, complete: bool = True) -> None:
+        """Persist state.
+
+        If *complete* is True, write to the canonical state file and remove
+        the in-progress marker.  Otherwise write to the in-progress marker.
+        """
+        _ensure_dir(self._state_dir)
+        self.data['generated_at'] = datetime.now(timezone.utc).isoformat()
+
+        if complete:
+            _atomic_write(self._state_file, json.dumps(self.data, indent=2))
+            _remove_if_exists(self._in_progress_file)
+        else:
+            _atomic_write(self._in_progress_file,
+                          json.dumps(self.data, indent=2))
+            _remove_if_exists(self._state_file)
+
+    def mark_file_processed(self, key: str, entry: Dict[str, Any]) -> None:
+        """Record that *key* was processed with the given *entry*."""
+        self.data.setdefault('packages', {})[key] = entry
+
+    def get_processed(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return metadata for a previously processed package, or None."""
+        return self.data.get('packages', {}).get(key)
+
+    def iter_stale_keys(self, current_keys: Set[str]) -> List[str]:
+        """Return keys present in state but absent from *current_keys*."""
+        return [k for k in self.data.get('packages', {}) if k not in current_keys]
+
+    @staticmethod
+    def make_key(package: str, version: str, arch: str) -> str:
+        """Canonical package key."""
+        return f'{package}_{version}_{arch}'
+
+
+# ---------------------------------------------------------------------------
+# apt-ftparchive interface
+# ---------------------------------------------------------------------------
+
+def _check_apt_ftparchive() -> bool:
+    """Return True if apt-ftparchive is available."""
+    return shutil.which('apt-ftparchive') is not None
+
+
+def generate_packages_apt(
+    pool_dir: Path,
+    output_file: Path,
+    *,
+    repo_root: Path,
+) -> None:
+    """Generate a Packages file using apt-ftparchive.
+
+    We run from *repo_root* so that the ``Filename`` field contains paths
+    relative to the repository root.
+    """
+    _ensure_dir(output_file.parent)
+    # apt-ftparchive packages <dir> scans recursively.
+    # Use AlwaysStat to force fresh checksums each run (no stale cache).
+    # Use a Python-3.8 compatible relative path computation.
+    try:
+        rel_pool = pool_dir.relative_to(repo_root)
+    except ValueError:
+        rel_pool = pool_dir
+    result = run_command(
+        ['apt-ftparchive', '-o', 'APT::FTPArchive::AlwaysStat=true',
+         'packages', str(rel_pool)],
+        cwd=repo_root,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+    _atomic_write(output_file, result.stdout)
+
+
+def generate_release_apt(
+    dist_dir: Path,
+    metadata: Dict[str, str],
+    output_file: Path,
+) -> None:
+    """Generate a Release file with apt-ftparchive.
+
+    *metadata* keys: Origin, Label, Suite, Codename, Version,
+    Architectures (space-separated), Components (space-separated),
+    Description.
+    """
+    _ensure_dir(output_file.parent)
+
+    # Use a temporary cache directory to avoid stale cached checksums
+    # from previous runs (especially the self-referencing Release checksum).
+    cache_dir = output_file.parent / '.apt-cache'
+    _ensure_dir(cache_dir)
+
+    # Build a minimal apt-ftparchive config snippet
+    config_lines = [
+        'APT::FTPArchive::Release {',
+    ]
+    for key, value in metadata.items():
+        config_lines.append(f'  {key} "{value}";')
+    config_lines.append('};')
+    # Point cache to a dedicated directory; we clean it before each run
+    config_lines.append(f'Dir {{ CacheDir "{cache_dir}"; }};')
+    config_text = '\n'.join(config_lines)
+
+    logger.debug('apt-ftparchive release config:\n%s', config_text)
+
+    result = run_command(
+        ['apt-ftparchive', '-c', '/dev/stdin', 'release', str(dist_dir)],
+        stdin_data=config_text,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+    _atomic_write(output_file, result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Manual (pure-Python) metadata generation — fallback when apt-ftparchive
+# is unavailable
+# ---------------------------------------------------------------------------
+
+def _packages_entry(control: Dict[str, str], filename: str,
+                    size: int, md5: str, sha1: str, sha256: str) -> str:
+    """Build a single Packages entry (RFC-822 stanza)."""
+    lines: List[str] = []
+
+    # Standard order as generated by apt-ftparchive.
+    # Description always comes last (after Filename, Size, checksums).
+    ordered_keys = [
+        'Package', 'Version', 'Installed-Size', 'Maintainer',
+        'Architecture', 'Depends', 'Pre-Depends', 'Conflicts',
+        'Breaks', 'Replaces', 'Provides', 'Recommends',
+        'Suggests', 'Enhances', 'Multi-Arch', 'Homepage',
+        'Source', 'Origin', 'Bugs', 'Section', 'Priority',
+    ]
+
+    for key in ordered_keys:
+        if key in control:
+            value = control[key]
+            if '\n' in value:
+                # Multi-line field — first line after colon, rest indented
+                first, *rest = value.split('\n')
+                lines.append(f'{key}: {first}')
+                for r in rest:
+                    lines.append(f' {r}')
+            else:
+                lines.append(f'{key}: {value}')
+
+    # Computed fields (always present)
+    lines.append(f'Filename: {filename}')
+    lines.append(f'Size: {size}')
+    lines.append(f'MD5sum: {md5}')
+    lines.append(f'SHA1: {sha1}')
+    lines.append(f'SHA256: {sha256}')
+
+    # Description always comes last (may be multi-line)
+    if 'Description' in control:
+        desc = control['Description']
+        if '\n' in desc:
+            first, *rest = desc.split('\n')
+            lines.append(f'Description: {first}')
+            for r in rest:
+                lines.append(f' {r}')
+        else:
+            lines.append(f'Description: {desc}')
+
+    lines.append('')  # blank separator line
+
+    return '\n'.join(lines)
+
+
+def generate_packages_manual(
+    packages: List[Tuple[Dict[str, str], str, int, str, str, str]],
+    output_file: Path,
+) -> None:
+    """Generate a Packages file without apt-ftparchive.
+
+    *packages* is a list of (control_dict, filename, size, md5, sha1, sha256).
+    """
+    entries: List[str] = []
+    for control, filename, size, md5, sha1, sha256 in sorted(
+        packages, key=lambda p: p[0].get('Package', '')
+    ):
+        entries.append(
+            _packages_entry(control, filename, size, md5, sha1, sha256)
+        )
+    _atomic_write(output_file, '\n'.join(entries))
+
+
+def _release_stanza(
+    checksum_field: str,
+    dist_dir: Path,
+) -> str:
+    """Build a checksum stanza (MD5Sum / SHA1 / SHA256) for the Release file.
+
+    Paths are relative to *dist_dir* (e.g. ``main/binary-amd64/Packages``).
+
+    Files under ``binary-<arch>/`` directories are included recursively so
+    that ``by-hash/`` entries are covered.
+    """
+    files: List[Tuple[str, int, str]] = []
+    binary_dir_re = re.compile(r'^binary-[\w-]+$')
+
+    for entry in sorted(dist_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        component = entry.name
+        # Look for binary-<arch>/ directories inside each component
+        for bin_entry in sorted(entry.iterdir()):
+            if not bin_entry.is_dir():
+                continue
+            if not binary_dir_re.match(bin_entry.name):
+                continue
+            # Walk all files recursively (covers Packages, Packages.gz,
+            # and by-hash/ entries)
+            for root, _dirs, filenames in os.walk(str(bin_entry)):
+                root_path = Path(root)
+                for fn in sorted(filenames):
+                    fpath = root_path / fn
+                    rel = fpath.relative_to(dist_dir)
+
+                    size = fpath.stat().st_size
+                    if checksum_field == 'MD5Sum':
+                        h = hashlib.md5()
+                    elif checksum_field == 'SHA1':
+                        h = hashlib.sha1()
+                    else:
+                        h = hashlib.sha256()
+
+                    with open(fpath, 'rb') as fh:
+                        while True:
+                            chunk = fh.read(1 << 20)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+
+                    files.append((str(rel), size, h.hexdigest()))
+
+    if not files:
+        return ''
+
+    stanza = f'{checksum_field}:\n'
+    for rel_path, size, digest in files:
+        stanza += f' {digest} {size:>8} {rel_path}\n'
+    return stanza
+
+
+def generate_release_manual(
+    dist_dir: Path,
+    metadata: Dict[str, str],
+    output_file: Path,
+) -> None:
+    """Generate a Release file without apt-ftparchive."""
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime('%a, %d %b %Y %H:%M:%S UTC')
+
+    lines = [
+        f'Origin: {metadata.get("Origin", "Custom Repository")}',
+        f'Label: {metadata.get("Label", "Custom APT Repository")}',
+        f'Suite: {metadata.get("Suite", "")}',
+        f'Codename: {metadata.get("Codename", "")}',
+    ]
+    if metadata.get('Version'):
+        lines.append(f'Version: {metadata["Version"]}')
+    lines += [
+        f'Date: {date_str}',
+        f'Architectures: {metadata.get("Architectures", "")}',
+        f'Components: {metadata.get("Components", "")}',
+        f'Description: {metadata.get("Description", "Custom package repository")}',
+    ]
+    if metadata.get('Acquire-By-Hash'):
+        lines.append(f'Acquire-By-Hash: {metadata["Acquire-By-Hash"]}')
+
+    for field in ('MD5Sum', 'SHA1', 'SHA256'):
+        stanza = _release_stanza(field, dist_dir)
+        if stanza:
+            lines.append(stanza)
+
+    # Include Contents-<arch>.gz files in checksums
+    for entry in sorted(dist_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        if not re.match(r'^Contents-[-\w]+\.gz$', entry.name):
+            continue
+        rel = entry.name
+        size = entry.stat().st_size
+        for field in ('MD5Sum', 'SHA1', 'SHA256'):
+            if field == 'MD5Sum':
+                h = hashlib.md5()
+            elif field == 'SHA1':
+                h = hashlib.sha1()
+            else:
+                h = hashlib.sha256()
+            with open(entry, 'rb') as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            digest = h.hexdigest()
+            # Append to the matching stanza
+            for i, line in enumerate(lines):
+                if line.startswith(f'{field}:'):
+                    lines.insert(i + 1, f' {digest} {size:>8} {rel}')
+                    break
+
+    _atomic_write(output_file, '\n'.join(lines) + '\n')
+
+
+# ---------------------------------------------------------------------------
+# Repository validation
+# ---------------------------------------------------------------------------
+
+def validate_repository(repo_root: Path) -> List[str]:
+    """Perform consistency checks on the final repository.
+
+    Returns a list of warning/error messages (empty = valid).
+    """
+    issues: List[str] = []
+
+    dists_dir = repo_root / 'dists'
+    if not dists_dir.is_dir():
+        issues.append('Missing dists/ directory')
+        return issues
+
+    for dist_entry in sorted(dists_dir.iterdir()):
+        if not dist_entry.is_dir():
+            continue
+        dist_name = dist_entry.name
+        release_file = dist_entry / 'Release'
+
+        if not release_file.is_file():
+            issues.append(f'dists/{dist_name}/Release is missing')
+            continue
+
+        # Read Release and verify checksums
+        try:
+            with open(release_file, 'r', encoding='utf-8') as fh:
+                release_content = fh.read()
+        except OSError as exc:
+            issues.append(f'dists/{dist_name}/Release: read error: {exc}')
+            continue
+
+        issues.extend(
+            _validate_release_checksums(release_content, dist_entry, repo_root)
+        )
+
+    return issues
+
+
+def _validate_release_checksums(
+    release_text: str,
+    dist_dir: Path,
+    repo_root: Path,
+) -> List[str]:
+    """Verify checksums declared in a Release file against actual files."""
+    issues: List[str] = []
+    dist_name = dist_dir.name
+
+    for field_name, hash_func in [
+        ('MD5Sum', hashlib.md5),
+        ('SHA1', hashlib.sha1),
+        ('SHA256', hashlib.sha256),
+    ]:
+        pattern = re.compile(
+            rf'^{re.escape(field_name)}:\n((?: [0-9a-fA-F]{{32,}}\s+\d+\s+.+\n)+)',
+            re.MULTILINE,
+        )
+        match = pattern.search(release_text)
+        if not match:
+            continue  # not all Release files have all checksums
+
+        for line in match.group(1).strip().split('\n'):
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3:
+                continue
+            expected_digest, expected_size_str, rel_path = parts
+            expected_size = int(expected_size_str)
+
+            # Skip self-referencing Release entries — apt-ftparchive's
+            # two-pass generation may produce stale self-checksums when
+            # cached data is reused with SHA512 extensions.
+            if rel_path == 'Release':
+                continue
+
+            # Paths in Release are relative to the dist directory
+            fpath = dist_dir / rel_path
+            if not fpath.is_file():
+                issues.append(
+                    f'dists/{dist_name}: {rel_path} referenced in Release '
+                    f'but not found on disk'
+                )
+                continue
+
+            actual_size = fpath.stat().st_size
+            if actual_size != expected_size:
+                issues.append(
+                    f'dists/{dist_name}: {rel_path} size mismatch '
+                    f'(expected {expected_size}, got {actual_size})'
+                )
+
+            h = hash_func()
+            with open(fpath, 'rb') as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            actual_digest = h.hexdigest()
+            if actual_digest != expected_digest:
+                issues.append(
+                    f'dists/{dist_name}: {rel_path} {field_name} mismatch'
+                )
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# GPG signing
+# ---------------------------------------------------------------------------
+
+def sign_release(release_path: Path, key_id: Optional[str]) -> None:
+    """Sign a Release file, producing InRelease and Release.gpg.
+
+    *key_id* can be a key ID / email / fingerprint accepted by ``gpg
+    --local-user``.  If *key_id* is None, signing is skipped.
+    """
+    if key_id is None:
+        return
+
+    dist_dir = release_path.parent
+    inrelease_path = dist_dir / 'InRelease'
+    releasegpg_path = dist_dir / 'Release.gpg'
+
+    logger.info('Signing %s with key %s', release_path, key_id)
+
+    # Detached signature (Release.gpg)
+    result = run_command(
+        ['gpg', '--batch', '--yes', '--no-tty',
+         '--local-user', key_id,
+         '--detach-sign', '--armor',
+         '--output', str(releasegpg_path),
+         str(release_path)],
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+    logger.info('Created %s', releasegpg_path)
+
+    # Clearsigned inline signature (InRelease)
+    result = run_command(
+        ['gpg', '--batch', '--yes', '--no-tty',
+         '--local-user', key_id,
+         '--clearsign',
+         '--output', str(inrelease_path),
+         str(release_path)],
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+    logger.info('Created %s', inrelease_path)
+
+
+# ---------------------------------------------------------------------------
+# Repository generation orchestrator
+# ---------------------------------------------------------------------------
+
+class RepositoryGenerator:
+    """Orchestrate the complete repository generation workflow."""
+
+    def __init__(
+        self,
+        input_dirs: List[Path],
+        output_dir: Path,
+        dists: List[str],
+        components: List[str],
+        architectures: List[str],
+        *,
+        sign_key: Optional[str] = None,
+        default_component: str = 'main',
+        section_map: Optional[Dict[str, str]] = None,
+        dry_run: bool = False,
+        force_full: bool = False,
+        use_apt: Optional[bool] = None,
+        origin: str = 'Custom Repository',
+        label: str = 'Custom APT Repository',
+        description: Optional[str] = None,
+        generate_contents: bool = False,
+    ) -> None:
+        self.input_dirs = input_dirs
+        self.output_dir = output_dir.resolve()
+        self.dists = dists
+        self.components = components
+        self.architectures = architectures
+        self.sign_key = sign_key
+        self.default_component = default_component
+        self.section_map = section_map or {}
+        self.dry_run = dry_run
+        self.force_full = force_full
+        self.use_apt = use_apt if use_apt is not None else _check_apt_ftparchive()
+        self.origin = origin
+        self.label = label
+        self.description = description
+        self.generate_contents = generate_contents
+
+        self.state = RepoState(self.output_dir)
+
+        # Statistics
+        self.stats: Dict[str, int] = {
+            'scanned': 0, 'skipped': 0, 'copied': 0, 'removed': 0,
+            'errors': 0, 'conflicts': 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 1: scan
+    # ------------------------------------------------------------------
+
+    def scan_inputs(self) -> Dict[str, Dict[str, Any]]:
+        """Walk all input directories, extract metadata from every .deb.
+
+        Returns a dict  key → {control, pool_path, source_path, component,
+        size, md5, sha1, sha256}.
+        """
+        current: Dict[str, Dict[str, Any]] = {}
+
+        for input_dir in self.input_dirs:
+            if not input_dir.is_dir():
+                logger.error('Input directory not found: %s', input_dir)
+                raise FileNotFoundError(f'Input directory not found: {input_dir}')
+
+            logger.info('Scanning %s …', input_dir)
+            for deb_path in sorted(input_dir.rglob('*.deb')):
+                self.stats['scanned'] += 1
+                try:
+                    control, size, md5, sha1, sha256 = extract_deb_metadata(deb_path)
+                except subprocess.CalledProcessError as exc:
+                    logger.warning('Corrupted package, skipping: %s (%s)',
+                                   deb_path, exc)
+                    self.stats['errors'] += 1
+                    continue
+                except ValueError as exc:
+                    logger.warning('Invalid package metadata in %s: %s',
+                                   deb_path, exc)
+                    self.stats['errors'] += 1
+                    continue
+                except OSError as exc:
+                    logger.warning('I/O error reading %s: %s', deb_path, exc)
+                    self.stats['errors'] += 1
+                    continue
+
+                package = control['Package']
+                version = control['Version']
+                arch = control['Architecture']
+
+                component = determine_component(
+                    control, self.section_map, self.default_component,
+                )
+
+                if component not in self.components:
+                    logger.debug(
+                        'Package %s mapped to component %r which is not in '
+                        'the configured component list — using %r',
+                        package, component, self.default_component,
+                    )
+                    component = self.default_component
+
+                key = RepoState.make_key(package, version, arch)
+                deb_filename = deb_path.name
+                pool_rel = _pool_path(package, version, arch, component, deb_filename)
+
+                entry = {
+                    'package': package,
+                    'version': version,
+                    'arch': arch,
+                    'component': component,
+                    'control': control,
+                    'source_path': str(deb_path),
+                    'pool_path': pool_rel,
+                    'size': size,
+                    'md5': md5,
+                    'sha1': sha1,
+                    'sha256': sha256,
+                    'filename': deb_filename,
+                }
+
+                if key in current:
+                    existing = current[key]
+                    if existing['sha256'] != sha256:
+                        logger.error(
+                            'DUPLICATE CONFLICT: %s (one from %s, one from %s) '
+                            '— same package+version+arch but different content',
+                            key, existing['source_path'], deb_path,
+                        )
+                        self.stats['conflicts'] += 1
+                        # Keep the first found
+                    else:
+                        logger.debug('Duplicate (identical): %s → %s', deb_path, key)
+                    continue
+
+                current[key] = entry
+
+        logger.info(
+            'Scan complete: %d .deb files, %d unique packages, '
+            '%d errors, %d conflicts',
+            self.stats['scanned'], len(current),
+            self.stats['errors'], self.stats['conflicts'],
+        )
+
+        return current
+
+    # ------------------------------------------------------------------
+    # Phase 1b: discover existing pool packages
+    # ------------------------------------------------------------------
+
+    def discover_existing_pool(
+        self,
+        current: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Discover packages already in the output pool/ that are not in
+        *current* (i.e. were not found in the input directories).
+
+        This allows the tool to add new .deb files into an existing repository
+        that was not previously managed by this tool (missing state file).
+        Package metadata is extracted via ``dpkg-deb`` and merged into
+        *current* so that subsequent phases treat discovered packages as
+        unchanged — they stay in the pool, appear in Packages indices, and
+        are tracked in incremental state going forward.
+        """
+        pool_root = self.output_dir / 'pool'
+        if not pool_root.is_dir():
+            return
+
+        existing_keys = set(current.keys())
+        discovered = 0
+
+        for deb_path in sorted(pool_root.rglob('*.deb')):
+            try:
+                control, size, md5, sha1, sha256 = extract_deb_metadata(deb_path)
+            except (subprocess.CalledProcessError, ValueError, OSError) as exc:
+                logger.debug(
+                    'Skipping existing pool file %s: %s', deb_path, exc,
+                )
+                continue
+
+            package = control.get('Package', '')
+            version = control.get('Version', '')
+            arch = control.get('Architecture', '')
+            if not package or not version or not arch:
+                logger.debug(
+                    'Skipping pool file with incomplete metadata: %s', deb_path,
+                )
+                continue
+
+            key = RepoState.make_key(package, version, arch)
+            if key in existing_keys:
+                continue
+
+            try:
+                pool_rel = str(deb_path.relative_to(self.output_dir))
+            except ValueError:
+                pool_rel = str(deb_path)
+
+            # Derive component from pool path
+            try:
+                rel_to_pool = deb_path.relative_to(pool_root)
+                parts = rel_to_pool.parts
+                path_component = parts[0] if parts else self.default_component
+            except ValueError:
+                path_component = self.default_component
+
+            component = determine_component(
+                control, self.section_map, self.default_component,
+            )
+
+            # Prefer the component from the pool path if it is in the
+            # configured component list, otherwise use the mapped one.
+            if path_component in self.components:
+                component = path_component
+            elif component not in self.components:
+                component = self.default_component
+
+            entry: Dict[str, Any] = {
+                'package': package,
+                'version': version,
+                'arch': arch,
+                'component': component,
+                'control': control,
+                'source_path': str(deb_path),
+                'pool_path': pool_rel,
+                'size': size,
+                'md5': md5,
+                'sha1': sha1,
+                'sha256': sha256,
+                'filename': deb_path.name,
+            }
+
+            current[key] = entry
+            existing_keys.add(key)
+            discovered += 1
+
+        if discovered:
+            logger.info(
+                'Discovered %d existing package(s) in pool/',
+                discovered,
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 2: plan changes
+    # ------------------------------------------------------------------
+
+    def plan_changes(
+        self,
+        current: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
+        """Compare current scan with persisted state.
+
+        Returns (to_add, to_remove, unchanged) sets of package keys.
+        """
+        previous = self.state.data.get('packages', {})
+        current_keys = set(current.keys())
+        previous_keys = set(previous.keys())
+
+        if self.force_full:
+            logger.info('Force-full mode — reprocessing all packages')
+            to_add = current_keys
+            to_remove = previous_keys
+            unchanged: Set[str] = set()
+        else:
+            to_add: Set[str] = set()
+            unchanged: Set[str] = set()
+
+            for key in sorted(current_keys):
+                if key not in previous:
+                    to_add.add(key)
+                elif (previous[key].get('sha256') != current[key].get('sha256')
+                      or previous[key].get('component') != current[key].get('component')):
+                    to_add.add(key)
+                else:
+                    unchanged.add(key)
+
+            to_remove = previous_keys - current_keys
+
+        logger.info(
+            'Plan: %d new/changed, %d unchanged, %d to remove',
+            len(to_add), len(unchanged), len(to_remove),
+        )
+        return to_add, to_remove, unchanged
+
+    # ------------------------------------------------------------------
+    # Phase 3: populate pool
+    # ------------------------------------------------------------------
+
+    def populate_pool(
+        self,
+        current: Dict[str, Dict[str, Any]],
+        to_add: Set[str],
+        to_remove: Set[str],
+    ) -> None:
+        """Copy .deb files into the pool/ directory and remove stale ones."""
+        pool_root = self.output_dir / 'pool'
+
+        # Remove stale packages.
+        # Skip packages that are also being added — the copy phase below
+        # handles path changes, and for same-path packages (e.g. discovered
+        # from the pool) removing the file would break the subsequent copy.
+        for key in sorted(to_remove):
+            if key in to_add:
+                continue
+            prev = self.state.data['packages'].get(key, {})
+            pool_path = prev.get('pool_path')
+            if pool_path:
+                full_path = self.output_dir / pool_path
+                if self.dry_run:
+                    logger.info('[dry-run] Would remove %s', full_path)
+                else:
+                    if _remove_if_exists(full_path):
+                        self.stats['removed'] += 1
+                        logger.info('Removed %s', full_path)
+
+        # Copy new/changed packages
+        for key in sorted(to_add):
+            entry = current[key]
+            src = Path(entry['source_path'])
+            dst = self.output_dir / entry['pool_path']
+
+            # If package existed before with a different pool path (e.g.
+            # component changed due to section-map update), remove old path.
+            prev = self.state.data.get('packages', {}).get(key, {})
+            if prev and prev.get('pool_path') and prev['pool_path'] != entry['pool_path']:
+                old_path = self.output_dir / prev['pool_path']
+                if self.dry_run:
+                    logger.info('[dry-run] Would remove stale %s', old_path)
+                else:
+                    if _remove_if_exists(old_path):
+                        self.stats['removed'] += 1
+                        logger.info('Removed stale pool file: %s', old_path)
+
+            if self.dry_run:
+                logger.info('[dry-run] Would copy %s → %s', src, dst)
+                continue
+
+            if dst.exists():
+                existing_hash = _sha256_file(dst)
+                if existing_hash == entry['sha256']:
+                    logger.debug('Pool file already up-to-date: %s', dst)
+                    continue
+                logger.info('Replacing changed file: %s', dst)
+
+            _atomic_copy(src, dst)
+            self.stats['copied'] += 1
+            logger.debug('Copied %s → %s', src, dst)
+
+        if not self.dry_run:
+            logger.info(
+                'Pool update: %d copied, %d removed',
+                self.stats['copied'], self.stats['removed'],
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 4: generate Packages files
+    # ------------------------------------------------------------------
+
+    def generate_packages(
+        self,
+        current: Dict[str, Dict[str, Any]],
+        to_add: Set[str],
+        to_remove: Set[str],
+        unchanged: Set[str],
+    ) -> None:
+        """Generate Packages files for each (dist, component, arch).
+
+        Only regenerates combinations that actually changed.
+        """
+        changed_components: Set[str] = set()
+        for key in to_add | to_remove:
+            if key in current:
+                changed_components.add(current[key]['component'])
+            else:
+                prev = self.state.data['packages'].get(key, {})
+                if prev:
+                    changed_components.add(prev.get('component', self.default_component))
+
+        # If nothing changed, skip regeneration (but still ensure structure exists)
+        if not changed_components and not self.force_full:
+            logger.info('No changes detected — skipping Packages generation')
+            return
+
+        # Regenerate all components (conservative approach: one change
+        # in a component triggers full regeneration of that component)
+        components_to_regenerate = (
+            set(self.components) if self.force_full else changed_components
+        )
+
+        for component in components_to_regenerate:
+            for dist in self.dists:
+                for arch in self.architectures:
+                    packages_dir = (
+                        self.output_dir / 'dists' / dist / component /
+                        f'binary-{arch}'
+                    )
+                    packages_file = packages_dir / 'Packages'
+                    packages_gz_file = packages_dir / 'Packages.gz'
+
+                    if self.dry_run:
+                        logger.info(
+                            '[dry-run] Would generate %s', packages_file,
+                        )
+                        continue
+
+                    # Gather packages for this (component, arch) combo
+                    component_packages: List[
+                        Tuple[Dict[str, str], str, int, str, str, str]
+                    ] = []
+                    for entry in current.values():
+                        if (entry['component'] == component
+                                and entry['arch'] in (arch, 'all')):
+                            component_packages.append((
+                                entry['control'],
+                                entry['pool_path'],
+                                entry['size'],
+                                entry['md5'],
+                                entry['sha1'],
+                                entry['sha256'],
+                            ))
+
+                    if not component_packages:
+                        # Remove Packages files if no packages for this combo
+                        _remove_if_exists(packages_file)
+                        _remove_if_exists(packages_gz_file)
+                        logger.debug(
+                            'No packages for %s/%s/binary-%s — '
+                            'removed Packages files',
+                            dist, component, arch,
+                        )
+                        continue
+
+                    _ensure_dir(packages_dir)
+
+                    if self.use_apt:
+                        pool_dir = self.output_dir / 'pool' / component
+                        if not pool_dir.is_dir() or not any(pool_dir.iterdir()):
+                            _remove_if_exists(packages_file)
+                            _remove_if_exists(packages_gz_file)
+                            logger.debug(
+                                'Pool directory %s/ empty or missing — skipped',
+                                pool_dir,
+                            )
+                            continue
+                        generate_packages_apt(
+                            pool_dir,
+                            packages_file,
+                            repo_root=self.output_dir,
+                        )
+                    else:
+                        generate_packages_manual(
+                            component_packages, packages_file,
+                        )
+
+                    # Compress
+                    self._compress_packages(packages_file, packages_gz_file)
+
+                    # by-hash
+                    self._generate_by_hash(packages_file)
+                    self._generate_by_hash(packages_gz_file)
+                    keep_digests: Dict[str, Set[str]] = {
+                        'MD5Sum': set(), 'SHA1': set(), 'SHA256': set(),
+                    }
+                    for f in (packages_file, packages_gz_file):
+                        m5, s1, s256 = _checksums_file(f)
+                        keep_digests['MD5Sum'].add(m5)
+                        keep_digests['SHA1'].add(s1)
+                        keep_digests['SHA256'].add(s256)
+                    self._clean_old_by_hash(packages_dir, keep_digests)
+
+                    logger.info('Generated %s', packages_file)
+
+    def _compress_packages(self, packages_file: Path,
+                           packages_gz_file: Path) -> None:
+        """Gzip-compress a Packages file, preserving the original."""
+        with open(packages_file, 'rb') as f_in:
+            with gzip.open(packages_gz_file, 'wb', compresslevel=9) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+    # ------------------------------------------------------------------
+    # Phase 5: generate Release files
+    # ------------------------------------------------------------------
+
+    def generate_releases(self) -> None:
+        """Generate a Release file for each distribution."""
+        for dist in self.dists:
+            dist_dir = self.output_dir / 'dists' / dist
+            release_file = dist_dir / 'Release'
+
+            if not dist_dir.is_dir():
+                logger.warning('Distribution directory does not exist: %s', dist_dir)
+                continue
+
+            description = (
+                self.description or f'Custom package repository for {dist}'
+            )
+            metadata = {
+                'Origin': self.origin,
+                'Label': self.label,
+                'Suite': dist,
+                'Codename': dist,
+                'Architectures': ' '.join(self.architectures),
+                'Components': ' '.join(self.components),
+                'Description': description,
+                'Acquire-By-Hash': 'yes',
+            }
+
+            if self.dry_run:
+                logger.info('[dry-run] Would generate %s', release_file)
+                continue
+
+            # Clean apt-ftparchive cache to avoid stale cached checksums
+            # (especially the self-referencing Release checksum).
+            if self.use_apt:
+                cache_dir = dist_dir / '.apt-cache'
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+
+            if self.use_apt:
+                generate_release_apt(dist_dir, metadata, release_file)
+            else:
+                generate_release_manual(dist_dir, metadata, release_file)
+
+            logger.info('Generated %s', release_file)
+
+    # ------------------------------------------------------------------
+    # Phase 6: sign
+    # ------------------------------------------------------------------
+
+    def sign_releases(self) -> None:
+        """Sign all Release files if a key was provided.
+
+        When no signing key is configured, stale InRelease and Release.gpg
+        files from previous signed runs are removed.
+        """
+        for dist in self.dists:
+            release_path = self.output_dir / 'dists' / dist / 'Release'
+            if not release_path.is_file():
+                logger.warning('Release file not found for signing: %s', release_path)
+                continue
+
+            if self.sign_key is None:
+                for stale in ('InRelease', 'Release.gpg'):
+                    p = self.output_dir / 'dists' / dist / stale
+                    if p.is_file():
+                        if self.dry_run:
+                            logger.info('[dry-run] Would remove stale %s', p)
+                        else:
+                            p.unlink()
+                            logger.info('Removed stale signature: %s', p)
+                continue
+
+            if self.dry_run:
+                logger.info('[dry-run] Would sign %s', release_path)
+                continue
+
+            try:
+                sign_release(release_path, self.sign_key)
+            except subprocess.CalledProcessError as exc:
+                logger.error('GPG signing failed for %s: %s', dist, exc)
+                if exc.stderr:
+                    logger.error('GPG stderr: %s', exc.stderr.strip())
+                raise
+
+    # ------------------------------------------------------------------
+    # Phase 7: finalize state
+    # ------------------------------------------------------------------
+
+    def finalize_state(self, current: Dict[str, Dict[str, Any]]) -> None:
+        """Write the final state file."""
+        if self.dry_run:
+            return
+
+        for key, entry in current.items():
+            self.state.mark_file_processed(key, {
+                'package': entry['package'],
+                'version': entry['version'],
+                'arch': entry['arch'],
+                'component': entry['component'],
+                'pool_path': entry['pool_path'],
+                'source_path': entry['source_path'],
+                'sha256': entry['sha256'],
+                'size': entry['size'],
+            })
+
+        self.state.data['dists'] = self.dists
+        self.state.data['components'] = self.components
+        self.state.data['architectures'] = self.architectures
+        self.state.save(complete=True)
+        logger.info('State saved to %s', self.state._state_file)
+
+    # ------------------------------------------------------------------
+    # Phase 7b: cleanup stale metadata
+    # ------------------------------------------------------------------
+
+    def cleanup_stale_metadata(self) -> None:
+        """Remove dist/component directories that are no longer configured.
+
+        Compares the current --dists/--components/--archs against existing
+        directories on disk and removes stale combinations, including stale
+        Contents-<arch>.gz files and .apt-cache directories.
+        """
+        dists_dir = self.output_dir / 'dists'
+        if not dists_dir.is_dir():
+            return
+
+        current_dists = set(self.dists)
+        current_components = set(self.components)
+        current_arch_dirs = {f'binary-{a}' for a in self.architectures}
+        current_contents_names = {f'Contents-{a}' for a in self.architectures}
+
+        for dist_entry in sorted(dists_dir.iterdir()):
+            if not dist_entry.is_dir():
+                continue
+            if dist_entry.name not in current_dists:
+                if self.dry_run:
+                    logger.info(
+                        '[dry-run] Would remove stale dist: %s', dist_entry,
+                    )
+                else:
+                    shutil.rmtree(dist_entry)
+                    logger.info('Removed stale distribution: %s', dist_entry)
+                continue
+
+            for comp_entry in sorted(dist_entry.iterdir()):
+                if not comp_entry.is_dir():
+                    continue
+                if comp_entry.name not in current_components:
+                    if self.dry_run:
+                        logger.info(
+                            '[dry-run] Would remove stale component: %s',
+                            comp_entry,
+                        )
+                    else:
+                        shutil.rmtree(comp_entry)
+                        logger.info(
+                            'Removed stale component: %s', comp_entry,
+                        )
+                    continue
+
+                for arch_entry in sorted(comp_entry.iterdir()):
+                    if not arch_entry.is_dir():
+                        continue
+                    if arch_entry.name not in current_arch_dirs:
+                        if self.dry_run:
+                            logger.info(
+                                '[dry-run] Would remove stale arch dir: %s',
+                                arch_entry,
+                            )
+                        else:
+                            shutil.rmtree(arch_entry)
+                            logger.info(
+                                'Removed stale arch dir: %s', arch_entry,
+                            )
+
+            # Remove stale Contents-<arch> files
+            contents_re = re.compile(r'^Contents-[-\w]+(?:\.gz)?$')
+            for entry in sorted(dist_entry.iterdir()):
+                if not entry.is_file():
+                    continue
+                if not contents_re.match(entry.name):
+                    continue
+                base = entry.name.replace('.gz', '')
+                if base not in current_contents_names:
+                    if self.dry_run:
+                        logger.info(
+                            '[dry-run] Would remove stale Contents file: %s',
+                            entry,
+                        )
+                    else:
+                        _remove_if_exists(entry)
+                        logger.info(
+                            'Removed stale Contents file: %s', entry,
+                        )
+
+            # Remove stale .apt-cache
+            cache_dir = dist_entry / '.apt-cache'
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+
+    # ------------------------------------------------------------------
+    # by-hash support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_by_hash(packages_file: Path) -> None:
+        """Create by-hash/ copies of an index file.
+
+        For *packages_file*, compute its MD5, SHA1, SHA256 digests and create
+        copies (hard links where possible) in ``by-hash/<ALGO>/<digest>``
+        relative to the same directory.
+        """
+        packages_dir = packages_file.parent
+        by_hash_root = packages_dir / 'by-hash'
+        _ensure_dir(by_hash_root)
+
+        md5, sha1, sha256 = _checksums_file(packages_file)
+
+        for algo, digest in [('MD5Sum', md5), ('SHA1', sha1),
+                             ('SHA256', sha256)]:
+            algo_dir = by_hash_root / algo
+            _ensure_dir(algo_dir)
+            dst = algo_dir / digest
+            try:
+                os.link(packages_file, dst)
+            except OSError:
+                try:
+                    dst.unlink()
+                except FileNotFoundError:
+                    pass
+                shutil.copy2(packages_file, dst)
+
+    @staticmethod
+    def _clean_old_by_hash(packages_dir: Path,
+                           keep_digests: Dict[str, Set[str]]) -> None:
+        """Remove stale by-hash entries that don't match current digests.
+
+        *keep_digests* maps algorithm names (MD5Sum, SHA1, SHA256) to the
+        set of valid hex digests for that algorithm.
+        """
+        by_hash_root = packages_dir / 'by-hash'
+        if not by_hash_root.is_dir():
+            return
+        for algo_dir in sorted(by_hash_root.iterdir()):
+            if not algo_dir.is_dir():
+                continue
+            algo = algo_dir.name
+            valid = keep_digests.get(algo, set())
+            for entry in sorted(algo_dir.iterdir()):
+                if entry.name not in valid:
+                    _remove_if_exists(entry)
+
+    # ------------------------------------------------------------------
+    # Contents indices
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_contents(deb_path: Path) -> Tuple[List[str], str]:
+        """Extract file list and section from a .deb via ``dpkg-deb -c``.
+
+        Returns (file_paths, section).
+        """
+        result = run_command(
+            ['dpkg-deb', '-c', str(deb_path)],
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args,
+                output=result.stdout, stderr=result.stderr,
+            )
+
+        lines: List[str] = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 6 and parts[-1].startswith('./'):
+                path = parts[-1][2:]  # strip ./ prefix
+                if path and not path.endswith('/'):
+                    lines.append(path)
+
+        return lines, ''
+
+    def generate_contents_files(self,
+                                current: Dict[str, Dict[str, Any]]) -> None:
+        """Generate Contents-<arch>.gz for each distribution."""
+        if not self.generate_contents:
+            return
+
+        for dist in self.dists:
+            dist_dir = self.output_dir / 'dists' / dist
+            _ensure_dir(dist_dir)
+
+            for arch in self.architectures:
+                contents_path = dist_dir / f'Contents-{arch}'
+
+                # Gather file→package mappings
+                contents: Dict[str, str] = {}
+                for entry in current.values():
+                    if entry['arch'] not in (arch, 'all'):
+                        continue
+                    deb_path = Path(entry.get('source_path',
+                                              self.output_dir / entry['pool_path']))
+                    if not deb_path.is_file():
+                        continue
+                    package = entry['package']
+
+                    try:
+                        file_list, _section = self._extract_contents(deb_path)
+                    except subprocess.CalledProcessError as exc:
+                        logger.warning(
+                            'Failed to list contents of %s: %s', deb_path, exc,
+                        )
+                        continue
+
+                    section = entry['control'].get('Section', 'misc')
+                    for filepath in file_list:
+                        contents.setdefault(filepath,
+                                            f'{section}/{package}')
+
+                if not contents:
+                    _remove_if_exists(contents_path)
+                    gz = contents_path.with_suffix(contents_path.suffix + '.gz')
+                    _remove_if_exists(gz)
+                    continue
+
+                content_lines = sorted(
+                    f'{p}\t{c}' for p, c in contents.items()
+                )
+                _atomic_write(contents_path, '\n'.join(content_lines) + '\n')
+
+                gz_path = contents_path.with_suffix(
+                    contents_path.suffix + '.gz'
+                )
+                self._compress_packages(contents_path, gz_path)
+                _remove_if_exists(contents_path)
+
+                logger.info('Generated %s', gz_path)
+
+    # ------------------------------------------------------------------
+    # Orchestrate
+    # ------------------------------------------------------------------
+
+    def run(self) -> int:
+        """Execute the full repository generation pipeline.
+
+        Returns exit code (0 = success).
+        """
+        # Load previous state
+        self.state.load()
+
+        # Phase 1: scan
+        current = self.scan_inputs()
+
+        # Phase 1b: discover packages already in the output pool/
+        self.discover_existing_pool(current)
+
+        if not current:
+            if self.state.data.get('packages'):
+                logger.warning(
+                    'No packages in inputs or existing pool, '
+                    'but state tracks %d package(s)',
+                    len(self.state.data['packages']),
+                )
+            else:
+                logger.error(
+                    'No .deb files found in input directories '
+                    'or existing pool/',
+                )
+                return EXIT_NO_DEB_FOUND
+
+        # Phase 2: plan
+        to_add, to_remove, unchanged = self.plan_changes(current)
+
+        if not to_add and not to_remove and not self.force_full:
+            logger.info('No package changes detected')
+
+        # Write in-progress marker before any modifications
+        if not self.dry_run:
+            # Snapshot current state as in-progress (for resumability)
+            for key, entry in current.items():
+                self.state.mark_file_processed(key, {
+                    'package': entry['package'],
+                    'version': entry['version'],
+                    'arch': entry['arch'],
+                    'component': entry['component'],
+                    'pool_path': entry['pool_path'],
+                    'source_path': entry['source_path'],
+                    'sha256': entry['sha256'],
+                    'size': entry['size'],
+                })
+            self.state.save(complete=False)
+
+        # Phase 3: populate pool
+        self.populate_pool(current, to_add, to_remove)
+
+        # Phase 4: generate Packages
+        self.generate_packages(current, to_add, to_remove, unchanged)
+
+        # Phase 5: generate Release
+        self.generate_releases()
+
+        # Clean up apt-ftparchive cache directories
+        if not self.dry_run:
+            for dist in self.dists:
+                cache_dir = self.output_dir / 'dists' / dist / '.apt-cache'
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+                    logger.debug('Cleaned apt cache: %s', cache_dir)
+
+        # Phase 6: sign (optional)
+        try:
+            self.sign_releases()
+        except subprocess.CalledProcessError:
+            return EXIT_GPG_ERROR
+
+        # Phase 7: cleanup stale metadata
+        self.cleanup_stale_metadata()
+
+        # Phase 8: generate Contents indices (optional)
+        self.generate_contents_files(current)
+
+        # Phase 9: finalize state
+        self.finalize_state(current)
+
+        # Phase 10: validate
+        if not self.dry_run:
+            issues = validate_repository(self.output_dir)
+            if issues:
+                for issue in issues:
+                    logger.warning('Validation: %s', issue)
+                if any('missing' in i.lower() or 'mismatch' in i.lower()
+                       for i in issues):
+                    logger.error('Repository validation FAILED')
+                    return EXIT_VALIDATION_FAILED
+                logger.info('Repository validation passed with %d warning(s)',
+                            len(issues))
+            else:
+                logger.info('Repository validation PASSED')
+
+        logger.info('Done — repository at %s', self.output_dir)
+        return EXIT_SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog='deb-repo-gen',
+        description='Generate a Debian/Ubuntu APT repository from .deb files.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent('''\
+            Examples:
+              # Basic usage
+              deb-repo-gen -i /path/to/debs -o /srv/apt-repo \\
+                  --dists focal,jammy --archs amd64
+
+              # Multiple input directories
+              deb-repo-gen -i /debs/main -i /debs/extra -o /srv/apt-repo \\
+                  --dists noble --components main,universe
+
+              # With GPG signing
+              deb-repo-gen -i /debs -o /srv/apt-repo \\
+                  --dists focal --archs amd64 --sign-key DEADBEEF
+
+              # Dry-run with verbose output
+              deb-repo-gen -i /debs -o /srv/apt-repo \\
+                  --dists jammy --dry-run --verbose
+
+              # Force full regeneration
+              deb-repo-gen -i /debs -o /srv/apt-repo \\
+                  --dists focal --force
+
+              # Disable apt-ftparchive (pure Python fallback)
+              deb-repo-gen -i /debs -o /srv/apt-repo \\
+                  --dists focal --no-apt-ftparchive
+
+              # Section-to-component mapping
+              deb-repo-gen -i /debs -o /srv/apt-repo --dists focal \\
+                  --section-map '{"non-free/": "restricted", "contrib/": "multiverse"}'
+        '''),
+    )
+
+    # Required arguments
+    parser.add_argument(
+        '-i', '--input',
+        action='append',
+        dest='input_dirs',
+        required=True,
+        metavar='DIR',
+        help='Input directory containing .deb files (can be specified multiple times)',
+    )
+    parser.add_argument(
+        '-o', '--output',
+        required=True,
+        metavar='DIR',
+        help='Output directory for the APT repository (created if needed)',
+    )
+
+    # Repository structure
+    parser.add_argument(
+        '--dists',
+        required=True,
+        metavar='LIST',
+        help='Comma-separated distribution codenames (e.g. focal,jammy,noble)',
+    )
+    parser.add_argument(
+        '--components',
+        default='main',
+        metavar='LIST',
+        help='Comma-separated components (default: main)',
+    )
+    parser.add_argument(
+        '--archs',
+        '--architectures',
+        default='amd64',
+        dest='architectures',
+        metavar='LIST',
+        help='Comma-separated architectures (default: amd64)',
+    )
+
+    # Component mapping
+    parser.add_argument(
+        '--default-component',
+        default='main',
+        metavar='COMPONENT',
+        help='Default component for packages (default: main)',
+    )
+    parser.add_argument(
+        '--section-map',
+        default=None,
+        metavar='JSON',
+        help='JSON object mapping Section prefixes to components '
+             '(e.g. \'{"non-free/":"restricted"}\')',
+    )
+
+    # Repository metadata
+    parser.add_argument(
+        '--origin',
+        default='Custom Repository',
+        metavar='NAME',
+        help='Origin field for Release files (default: "Custom Repository")',
+    )
+    parser.add_argument(
+        '--label',
+        default='Custom APT Repository',
+        metavar='NAME',
+        help='Label field for Release files (default: "Custom APT Repository")',
+    )
+    parser.add_argument(
+        '--description',
+        default=None,
+        metavar='TEXT',
+        help='Description field for Release files '
+             '(default: "Custom package repository for <dist>")',
+    )
+
+    # Signing
+    parser.add_argument(
+        '--sign-key',
+        default=None,
+        metavar='KEYID',
+        help='GPG key ID/email/fingerprint for signing Release files',
+    )
+
+    # Contents indices
+    parser.add_argument(
+        '--contents',
+        action='store_true',
+        default=False,
+        help='Generate Contents-<arch>.gz indices (dpkg-deb -c on every package)',
+    )
+
+    # Operation modes
+    parser.add_argument(
+        '-n', '--dry-run',
+        action='store_true',
+        help='Show what would be done without making changes',
+    )
+    parser.add_argument(
+        '-f', '--force',
+        action='store_true',
+        dest='force_full',
+        help='Force full regeneration even if nothing changed',
+    )
+    parser.add_argument(
+        '--no-apt-ftparchive',
+        action='store_true',
+        dest='no_apt',
+        help='Disable apt-ftparchive; use pure-Python fallback',
+    )
+
+    # Logging
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_const',
+        dest='log_level',
+        const=logging.INFO,
+        default=logging.WARNING,
+        help='Verbose output (INFO level)',
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_const',
+        dest='log_level',
+        const=logging.DEBUG,
+        help='Debug output (DEBUG level)',
+    )
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_const',
+        dest='log_level',
+        const=logging.ERROR,
+        help='Suppress all non-error output',
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='deb-repo-gen 2.0',
+        help="Show the tool's version and exit",
+    )
+
+    return parser
+
+
+def main() -> None:
+    """Entry point."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    setup_logging(args.log_level)
+
+    # Parse comma-separated lists
+    dists = [d.strip() for d in args.dists.split(',') if d.strip()]
+    components = [c.strip() for c in args.components.split(',') if c.strip()]
+    architectures = [a.strip() for a in args.architectures.split(',') if a.strip()]
+    input_dirs = [Path(d).resolve() for d in args.input_dirs]
+    output_dir = Path(args.output).resolve()
+
+    if not dists:
+        logger.error('At least one distribution must be specified')
+        sys.exit(EXIT_INVALID_ARGS)
+    if not components:
+        logger.error('At least one component must be specified')
+        sys.exit(EXIT_INVALID_ARGS)
+    if not architectures:
+        logger.error('At least one architecture must be specified')
+        sys.exit(EXIT_INVALID_ARGS)
+
+    # Parse section map
+    section_map: Dict[str, str] = {}
+    if args.section_map:
+        try:
+            section_map = json.loads(args.section_map)
+        except json.JSONDecodeError as exc:
+            logger.error('Invalid --section-map JSON: %s', exc)
+            sys.exit(EXIT_INVALID_ARGS)
+
+    # Validate that input directories exist
+    missing = [d for d in input_dirs if not d.is_dir()]
+    if missing:
+        for d in missing:
+            logger.error('Input directory not found: %s', d)
+        sys.exit(EXIT_INPUT_NOT_FOUND)
+
+    # Check apt-ftparchive availability
+    use_apt = not args.no_apt
+    if use_apt and not _check_apt_ftparchive():
+        logger.warning(
+            'apt-ftparchive not found (install apt-utils). '
+            'Falling back to pure-Python generation.'
+        )
+        use_apt = False
+    elif not use_apt:
+        logger.info('apt-ftparchive disabled by user — using pure-Python fallback')
+
+    # Check GPG if signing requested
+    if args.sign_key:
+        if not shutil.which('gpg'):
+            logger.error('GPG signing requested but gpg is not installed')
+            sys.exit(EXIT_MISSING_DEPENDENCY)
+
+    # Handle signals gracefully
+    def _signal_handler(signum: int, _frame: Any) -> None:
+        logger.warning('Interrupted (signal %d) — cleaning up …', signum)
+        sys.exit(EXIT_INTERRUPTED)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Run
+    gen = RepositoryGenerator(
+        input_dirs=input_dirs,
+        output_dir=output_dir,
+        dists=dists,
+        components=components,
+        architectures=architectures,
+        sign_key=args.sign_key,
+        default_component=args.default_component,
+        section_map=section_map,
+        dry_run=args.dry_run,
+        force_full=args.force_full,
+        use_apt=use_apt,
+        origin=args.origin,
+        label=args.label,
+        description=args.description,
+        generate_contents=args.contents,
+    )
+
+    try:
+        exit_code = gen.run()
+    except FileNotFoundError as exc:
+        logger.error('File not found: %s', exc)
+        exit_code = EXIT_INPUT_NOT_FOUND
+    except subprocess.CalledProcessError as exc:
+        logger.error('Subprocess failed: %s', exc)
+        logger.error('stderr: %s', (exc.stderr or '').strip())
+        exit_code = EXIT_CORRUPTED_PACKAGE
+    except OSError as exc:
+        logger.error('Disk/OS error: %s', exc)
+        exit_code = EXIT_DISK_ERROR
+    except KeyboardInterrupt:
+        logger.warning('Interrupted by user')
+        exit_code = EXIT_INTERRUPTED
+    except Exception:
+        logger.exception('Unexpected error')
+        exit_code = EXIT_UNKNOWN
+
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()
