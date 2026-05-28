@@ -4,7 +4,7 @@ Generate a Debian/Ubuntu APT repository from `.deb` packages — no external Pyt
 
 ## Features
 
-- Recursively scans one or more input directories for `.deb` files
+- Recursively scans one or more input directories for `.deb` files, or accepts individual `.deb` files directly
 - Extracts package metadata via `dpkg-deb`
 - Multi-distribution, multi-component, multi-architecture support
 - Full APT metadata: `Packages`, `Packages.gz`, `Release`, `InRelease`, `Release.gpg`
@@ -12,12 +12,15 @@ Generate a Debian/Ubuntu APT repository from `.deb` packages — no external Pyt
 - `Contents-<arch>.gz` indices (`--contents`) for `apt-file` lookups
 - Optional GPG signing
 - Adds packages to **existing** repositories — auto-discovers pool content
-- Incremental updates — only processes changed packages
+- **Quick mode** — fast incremental addition of packages to large repos
+- **Incremental updates** — only processes changed packages
+- **Incremental Packages patching** — modifies existing index files instead of regenerating from scratch
 - Idempotent — repeated runs produce identical output
 - Duplicate and conflict detection
 - Corrupted `.deb` files are skipped and logged, never abort
 - Resumable after interruption thanks to in-progress state markers
 - Built-in repository consistency validation
+- Progress bars for scanning, pool discovery, and metadata generation
 - Dry-run and verbose modes
 - Falls back to pure-Python generation when `apt-ftparchive` is unavailable
 
@@ -47,14 +50,16 @@ sudo apt install apt-utils gpg         # optional but recommended
 ## Usage
 
 ```
-deb-repo-gen -i <input-dir> -o <output-dir> --dists <codenames> [options]
+deb-repo-gen -i <path> -o <output-dir> --dists <codenames> [options]
 ```
+
+`-i` accepts directories (scanned recursively for `.deb` files) **or** individual `.deb` files.
 
 ### Required arguments
 
 | Flag               | Description                                                  |
 |--------------------|--------------------------------------------------------------|
-| `-i`, `--input`    | Input directory with `.deb` files (repeatable)               |
+| `-i`, `--input`    | Input directory or `.deb` file (repeatable)                  |
 | `-o`, `--output`   | Output directory for the APT repository                      |
 | `--dists`          | Comma-separated distribution codenames (e.g. `jammy,noble`)  |
 
@@ -73,51 +78,129 @@ deb-repo-gen -i <input-dir> -o <output-dir> --dists <codenames> [options]
 | `--sign-key`             | GPG key ID/email/fingerprint for signing                     |
 | `-n`, `--dry-run`        | Show what would be done without making changes               |
 | `-f`, `--force`          | Force full regeneration (ignore incremental state)           |
+| `--trust-pool`           | Trust existing pool — skip re-analysis of destination repo   |
+| `--skip-validation`      | Skip repository consistency validation after generation      |
+| `--quick`                | Fast incremental add — implies `--trust-pool` and            |
+|                          | `--skip-validation`, patches Packages instead of regen       |
 | `--no-apt-ftparchive`    | Use pure-Python fallback instead of `apt-ftparchive`         |
-| `--version`              | Print version and exit                                       |
 | `-v`, `--verbose`        | Verbose output                                               |
 | `--debug`                | Debug output                                                 |
 | `-q`, `--quiet`          | Suppress non-error output                                    |
+| `--version`              | Print version and exit                                       |
 
 ## Examples
 
+### Quickest — add a single package to an existing repo
+
 ```bash
-# Basic repository with a single distribution and architecture
-deb-repo-gen -i /path/to/debs -o /srv/apt-repo --dists jammy --archs amd64
+deb-repo-gen -i nginx_1.24.0-1_amd64.deb -o /srv/apt-repo --dists jammy --quick
+```
 
-# Multiple input directories and distributions
-deb-repo-gen -i /debs/main -i /debs/extra -o /srv/apt-repo \
-    --dists jammy,noble --components main,universe
+`--quick` patches the existing Packages files incrementally (no full rescan, no
+re-validation). Ideal for CI/CD pipelines pushing one or a few packages at a
+time. Metadata (Packages, Release, signatures) is always refreshed.
 
-# Add packages to an existing repository (auto-discovers pool content)
-deb-repo-gen -i /new/debs -o /srv/existing-repo --dists jammy --archs amd64
+### Quick — add a few packages with a dry-run first
 
-# Custom Release metadata
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy \
+```bash
+# Preview what would happen
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy --quick --dry-run -v
+
+# Then actually run it
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy --quick
+```
+
+### Moderate — standard incremental update
+
+```bash
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy --archs amd64
+```
+
+Scans the input directory, discovers new/changed packages, and only
+regenerates affected components. Existing pool packages are discovered
+via existing Packages indices when available (fast), falling back to
+`dpkg-deb` extraction for any unindexed packages.
+
+### Moderate — incremental with GPG signing
+
+```bash
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy \
+    --archs amd64 --sign-key admin@example.com
+```
+
+### Moderate — trust the existing pool, skip validation
+
+```bash
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy \
+    --archs amd64 --trust-pool --skip-validation
+```
+
+`--trust-pool` loads existing package metadata from state and Packages
+files (no `dpkg-deb` calls for existing packages). `--skip-validation`
+avoids the post-generation checksum verification pass. Unlike `--quick`,
+this still does full Packages regeneration and stale metadata cleanup.
+
+### Full — first-time repository creation
+
+```bash
+deb-repo-gen -i /all-debs/ -o /srv/apt-repo \
+    --dists jammy,noble --archs amd64,arm64 \
+    --components main,universe
+```
+
+Full scan, full generation, full validation. This is the slowest but
+most thorough mode.
+
+### Full — with Contents indices and signing
+
+```bash
+deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy \
+    --archs amd64,arm64 --contents --sign-key DEADBEEF
+```
+
+`--contents` generates `Contents-<arch>.gz` indices (enables `apt-file`
+lookups) by running `dpkg-deb -c` on every package. This is
+significantly slower — avoid unless needed.
+
+### Full — custom metadata and section mapping
+
+```bash
+deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy \
     --origin "MyCompany" --label "Internal APT" \
-    --description "Internal packages for jammy"
-
-# With Contents indices (enables apt-file)
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy \
-    --archs amd64 --contents
-
-# With GPG signing
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy \
-    --archs amd64 --sign-key DEADBEEF
-
-# Dry-run to preview changes
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy --dry-run --verbose
-
-# Force full regeneration
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy --force
-
-# Without apt-ftparchive (pure Python)
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy --no-apt-ftparchive
-
-# Section-to-component mapping (non-free → restricted, contrib → multiverse)
-deb-repo-gen -i /debs -o /srv/apt-repo --dists jammy \
+    --description "Internal packages for jammy" \
     --section-map '{"non-free/": "restricted", "contrib/": "multiverse"}'
 ```
+
+### Full — force regeneration of everything
+
+```bash
+deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy --force
+```
+
+Ignores incremental state and regenerates all metadata from scratch.
+
+## Disk space considerations
+
+Atomic file writes use temporary files created **alongside the target**
+(in the output directory, not in `/tmp`). This means:
+
+- **The output filesystem must have enough space for both the old and new
+  version of each file** during replacement. For large Packages or Release
+  files this is negligible, but for `.deb` copies the temporary file is as
+  large as the package itself.
+- **Pool growth is cumulative** — packages are never pruned automatically.
+  A repository holding 1,000 packages averaging 50 MB each consumes ~50 GB
+  in `pool/` alone, plus metadata overhead.
+- **`by-hash/` stores up to 3 extra copies** of each Packages/Packages.gz
+  file (one per hash algorithm). On repos with many distributions,
+  components, and architectures, this can add up.
+- **`--contents` doubles I/O** — `Contents-<arch>.gz` files can be large
+  (hundreds of MB for repos with tens of thousands of packages) and are
+  written atomically, requiring transient extra disk space.
+- **Monitor disk usage** with `du -sh /srv/apt-repo/pool/` and
+  `du -sh /srv/apt-repo/dists/` to catch growth before it becomes a
+  problem. The `.repo-state/state.json` file also grows with the number
+  of tracked packages.
 
 ## Repository layout
 
@@ -173,7 +256,7 @@ If signed, replace `[trusted=yes]` with `signed-by=/etc/apt/keyrings/custom.asc`
 |------|-----------------------------|
 | 0    | Success                     |
 | 1    | Invalid arguments           |
-| 2    | Input directory not found   |
+| 2    | Input path not found        |
 | 3    | No `.deb` files found       |
 | 4    | Missing dependency          |
 | 5    | Corrupted package           |
@@ -192,15 +275,28 @@ against this state and only process new, changed, or removed packages.
 
 Use `--force` to ignore saved state and regenerate everything.
 
+### Quick mode
+
+`--quick` is optimized for the common workflow of adding a few packages to an
+existing large repository. It:
+
+- Implies `--trust-pool` — loads existing packages from state/Packages files
+  instead of re-running `dpkg-deb` on every `.deb` in the pool
+- Implies `--skip-validation` — skips the post-generation checksum pass
+- Patches existing `Packages` files incrementally (only adds/replaces/removes
+  changed stanzas) instead of regenerating from scratch
+- Forces pure-Python mode (`apt-ftparchive` does not support patching)
+- Skips stale metadata cleanup
+
+Metadata (Packages, Packages.gz, Release, by-hash, signatures) is **always
+refreshed** — only the *method* changes (patch vs. full regen).
+
 ## Limitations
 
 - **Single-instance only** — running two instances against the same output
   directory concurrently will corrupt the incremental state and produce
   inconsistent metadata. The in-progress marker detects interrupted runs but
   does not actively lock the repository.
-- **`dpkg-deb` required on every run** — even for existing pool packages
-  during discovery, metadata is re-extracted. On very large repositories
-  this adds noticeable startup time.
 - **No version pruning** — all versions of a package present in the input
   directories or pool are retained indefinitely. There is no `--keep-latest`
   or automatic old-version cleanup.
@@ -223,13 +319,6 @@ Use `--force` to ignore saved state and regenerate everything.
 - **Validation checksums ignore `Release` self-reference** — apt-ftparchive
   sometimes produces stale self-referencing checksum entries. These are
   deliberately skipped during validation.
-- **`_KNOWN_ARCHITECTURES` unused** — the frozenset of known Debian
-  architecture names is declared in the source but never validated against
-  user input. Any architecture string is accepted.
-- **No progress bar** — large repositories may take considerable time with
-  no visual feedback beyond per-file log messages (visible with `--verbose`).
-- **No built-in HTTP server** — the output directory must be served by an
-  external web server (nginx, Apache, Python `http.server`, etc.).
 
 ## License
 
