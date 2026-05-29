@@ -316,9 +316,46 @@ def _pool_prefix(package_name: str) -> str:
     return m.group(1) if m else package_name[0]
 
 
+def _sanitize_path_component(value: str, label: str) -> str:
+    """Strip path separators and traversal sequences from a pool-path component."""
+    sanitized = value.replace('\\', '_').replace('/', '_')
+    if sanitized in ('.', '..') or not sanitized:
+        raise ValueError(
+            f'{label} resolves to an unsafe filesystem name: {value!r}'
+        )
+    return sanitized
+
+
+def _safe_pool_dest(repo_root: Path, pool_path: str) -> Path:
+    """Join *pool_path* under *repo_root*, raising if the result escapes.
+
+    Uses :meth:`pathlib.PurePath.relative_to` which works on Python 3.8+.
+    """
+    dest = (repo_root / pool_path).resolve()
+    resolved_root = repo_root.resolve()
+    try:
+        dest.relative_to(resolved_root)
+    except ValueError:
+        raise ValueError(
+            f'Path traversal denied — {pool_path!r} resolves outside '
+            f'{resolved_root}'
+        )
+    return dest
+
+
 def _pool_path(package: str, version: str, arch: str,
                component: str, filename: str) -> str:
-    """Build a relative pool path like pool/main/n/nginx/nginx_1.0_amd64.deb."""
+    """Build a relative pool path like pool/main/n/nginx/nginx_1.0_amd64.deb.
+
+    Every component is sanitized against path-traversal sequences before
+    the path is assembled.
+    """
+    package = _sanitize_path_component(package, 'Package')
+    version = _sanitize_path_component(version, 'Version')
+    arch = _sanitize_path_component(arch, 'Architecture')
+    component = _sanitize_path_component(component, 'Component')
+    filename = _sanitize_path_component(filename, 'Filename')
+
     prefix = _pool_prefix(package)
     return f'pool/{component}/{prefix}/{package}/{filename}'
 
@@ -1569,7 +1606,7 @@ class RepositoryGenerator:
             prev = self.state.data['packages'].get(key, {})
             pool_path = prev.get('pool_path')
             if pool_path:
-                full_path = self.output_dir / pool_path
+                full_path = _safe_pool_dest(self.output_dir, pool_path)
                 if self.dry_run:
                     logger.info('[dry-run] Would remove %s', full_path)
                 else:
@@ -1585,13 +1622,13 @@ class RepositoryGenerator:
             progress.update()
             entry = current[key]
             src = Path(entry['source_path'])
-            dst = self.output_dir / entry['pool_path']
+            dst = _safe_pool_dest(self.output_dir, entry['pool_path'])
 
             # If package existed before with a different pool path (e.g.
             # component changed due to section-map update), remove old path.
             prev = self.state.data.get('packages', {}).get(key, {})
             if prev and prev.get('pool_path') and prev['pool_path'] != entry['pool_path']:
-                old_path = self.output_dir / prev['pool_path']
+                old_path = _safe_pool_dest(self.output_dir, prev['pool_path'])
                 if self.dry_run:
                     logger.info('[dry-run] Would remove stale %s', old_path)
                 else:
