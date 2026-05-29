@@ -10,7 +10,9 @@ Generate a Debian/Ubuntu APT repository from `.deb` packages — no external Pyt
 - Full APT metadata: `Packages`, `Packages.gz`, `Release`, `InRelease`, `Release.gpg`
 - `by-hash/` support — hash-named index copies for atomic APT updates
 - `Contents-<arch>.gz` indices (`--contents`) for `apt-file` lookups
-- Optional GPG signing
+- Optional GPG signing with **key persistence** — specify the key once, it's auto-detected on subsequent runs
+- **Sign-only mode** — (re)sign an existing repository without re-processing packages
+- **Auto key generation** — create RSA 4096 keys directly from the tool (`--generate-key`)
 - Adds packages to **existing** repositories — auto-discovers pool content
 - **Quick mode** — fast incremental addition of packages to large repos
 - **Incremental updates** — only processes changed packages
@@ -31,7 +33,7 @@ Generate a Debian/Ubuntu APT repository from `.deb` packages — no external Pyt
 | Python 3.8+       | Required  | Runtime                                      |
 | `dpkg-deb`        | Required  | `.deb` metadata extraction                   |
 | `apt-ftparchive`  | Optional  | Faster metadata generation (`apt-utils`)     |
-| `gpg`             | Optional  | Signing Release files (`--sign-key`)         |
+| `gpg`             | Optional  | Signing Release files. Required by `--sign-key`, `--sign-only`, `--generate-key`. |
 
 The script uses **only the Python standard library** — no pip packages needed.
 
@@ -59,9 +61,9 @@ deb-repo-gen -i <path> -o <output-dir> --dists <codenames> [options]
 
 | Flag               | Description                                                  |
 |--------------------|--------------------------------------------------------------|
-| `-i`, `--input`    | Input directory or `.deb` file (repeatable)                  |
+| `-i`, `--input`    | Input directory or `.deb` file (repeatable). Not required with `--sign-only`. |
 | `-o`, `--output`   | Output directory for the APT repository                      |
-| `--dists`          | Comma-separated distribution codenames (e.g. `jammy,noble`)  |
+| `--dists`          | Comma-separated distribution codenames (e.g. `jammy,noble`). Not required with `--sign-only` (auto-detected). |
 
 ### Optional arguments
 
@@ -75,7 +77,12 @@ deb-repo-gen -i <path> -o <output-dir> --dists <codenames> [options]
 | `--label`                | `Label` field in Release files (default: `Custom APT Repository`)|
 | `--description`          | `Description` field in Release files                         |
 | `--contents`             | Generate `Contents-<arch>.gz` file-to-package indices        |
-| `--sign-key`             | GPG key ID/email/fingerprint for signing                     |
+| `--sign-key`             | GPG key ID/email/fingerprint for signing. Persisted to state — only needed once. |
+| `--sign-only`            | Only (re)sign an existing repo — skips scanning, pool population, and validation |
+| `--no-sign`              | Skip all GPG operations entirely — leave existing signatures untouched |
+| `--generate-key`         | Generate an RSA 4096 GPG key pair for signing (no passphrase). Requires `--key-email`. |
+| `--key-name`             | Real name for auto-generated GPG key (default: `APT Repository`) |
+| `--key-email`            | Email for auto-generated GPG key (required with `--generate-key`) |
 | `-n`, `--dry-run`        | Show what would be done without making changes               |
 | `-f`, `--force`          | Force full regeneration (ignore incremental state)           |
 | `--trust-pool`           | Trust existing pool — skip re-analysis of destination repo   |
@@ -139,6 +146,55 @@ deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy \
 files (no `dpkg-deb` calls for existing packages). `--skip-validation`
 avoids the post-generation checksum verification pass. Unlike `--quick`,
 this still does full Packages regeneration and stale metadata cleanup.
+
+### GPG signing — first time setup
+
+```bash
+# Generate a key and sign an existing repo in one step
+deb-repo-gen --sign-only --generate-key --key-email admin@example.com \
+    -o /srv/apt-repo
+
+# Or create a fresh signed repo from scratch
+deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy \
+    --archs amd64 --sign-key admin@example.com
+```
+
+The signing key is automatically persisted to `.repo-state/state.json`. On all
+subsequent runs, the tool reuses it — you never need to specify `--sign-key`
+again.
+
+### GPG signing — subsequent runs (key auto-detected)
+
+```bash
+# Add packages — key is reused automatically from state
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy --quick
+```
+
+### GPG signing — add packages without touching signatures
+
+```bash
+# Update metadata but leave existing InRelease/Release.gpg alone
+deb-repo-gen -i /new-debs/ -o /srv/apt-repo --dists jammy --no-sign
+```
+
+Useful in CI when signing is handled by a separate step. Run `deb-repo-gen --sign-only -o /srv/apt-repo`
+afterwards to re-sign.
+
+### GPG — distribute the public key to clients
+
+```bash
+# Export the public key
+gpg --export --armor admin@example.com > my-repo-keyring.asc
+
+# On each client, install it
+sudo cp my-repo-keyring.asc /usr/share/keyrings/my-repo-keyring.asc
+```
+
+Then in `/etc/apt/sources.list.d/custom.list`:
+
+```
+deb [signed-by=/usr/share/keyrings/my-repo-keyring.asc] https://server/apt/ jammy main
+```
 
 ### Full — first-time repository creation
 

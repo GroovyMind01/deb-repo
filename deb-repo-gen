@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-deb-repo-gen — Generate a Debian/Ubuntu APT repository from a directory tree
-of .deb packages.
+deb-repo-gen — Generate a Debian/Ubuntu APT repository from .deb packages.
 
-Features:
-  - Recursive .deb scanning from one or more input directories
-  - Automatic metadata extraction via dpkg-deb
-  - Multi-distribution / multi-component / multi-architecture support
-  - Full APT repository metadata: Packages, Packages.gz, Release, InRelease, Release.gpg
-  - Optional GPG signing
-  - Fully offline / air-gapped operation
-  - Incremental updates — only processes changed packages
-  - Idempotent — multiple runs with same inputs produce identical results
-  - Duplicate and conflict detection
-  - Corrupted .deb handling (skip + log, never abort)
-  - Dry-run, verbose, and debug modes
-  - Resumability after interruption
-  - Built-in repository consistency validation
-  - Primary backend: apt-ftparchive (from apt-utils)
-  - Fallback backend: pure Python manual generation (zero extra deps)
-  - Strict error handling, meaningful exit codes
-  - ShellCheck-compliant style is not applicable (Python), but pylint-clean
+Pipeline (RepositoryGenerator.run):
+  Phase 1    scan_inputs()          — walk input dirs, dpkg-deb -f each .deb
+  Phase 1b   discover_existing_pool — find .debs already in output pool/
+  Phase 2    plan_changes()         — diff current scan against persisted state
+  Phase 3    populate_pool()        — copy/remove .debs in pool/
+  Phase 4    generate_packages()    — write Packages + Packages.gz + by-hash/
+  Phase 5    generate_releases()    — write Release per dist
+  Phase 6    sign_releases()        — GPG-sign (InRelease, Release.gpg)
+  Phase 7    cleanup_stale_metadata — remove old dist/component dirs
+  Phase 8    generate_contents_files— Contents-<arch>.gz (--contents)
+  Phase 9    finalize_state()       — persist state.json
+  Phase 10   validate_repository()  — verify checksums in Release
+
+Key design decisions:
+  - Zero external Python deps (stdlib only: argparse, gzip, hashlib, json, ...)
+  - Atomic writes via tempfile in output dir + os.replace (not /tmp)
+  - Incremental: state.json tracks package→sha256, only changed packages reprocess
+  - --quick patches existing Packages files; forces pure-Python (apt-ftparchive
+    always does full scans, defeating the purpose of incremental patching)
+  - --sign-key persists in state.json; subsequent runs auto-detect it
+  - --sign-only skips Phases 1-4, auto-detects dists/components/archs from disk
+
+Code organisation:
+  Lines ~1-80          Constants, logging, utilities, progress bars
+  Lines ~80-420        dpkg-deb interface, control parsing, package metadata
+  Lines ~420-490       RepoState — persistent state for incremental operation
+  Lines ~490-580       apt-ftparchive interface
+  Lines ~580-770       Pure-Python metadata generation (fallback)
+  Lines ~770-880       Repository validation (checksum verification)
+  Lines ~880-1007      GPG signing + key generation + repo auto-detection
+  Lines ~1007-2000     RepositoryGenerator class (phases 1-8 as methods)
+  Lines ~2000-2200     Orchestration (run, _run_sign_only)
+  Lines ~2200-end      CLI (argparse builder + main entry point)
 """
 
 from __future__ import annotations
@@ -926,12 +940,108 @@ def sign_release(release_path: Path, key_id: Optional[str]) -> None:
     logger.info('Created %s', inrelease_path)
 
 
+def _generate_gpg_key(name: str, email: str) -> str:
+    """Generate a GPG key pair (RSA 4096, no expiry, no passphrase).
+
+    Returns the key identifier (email) that can be passed to
+    ``--local-user`` for signing.  Skips generation if a key for
+    *email* already exists in the keyring.
+    """
+    if not shutil.which('gpg'):
+        raise FileNotFoundError('gpg not found — cannot generate GPG key')
+
+    # Check if key already exists
+    result = run_command(
+        ['gpg', '--list-keys', '--with-colons', email],
+        timeout=10,
+    )
+    if result.returncode == 0 and 'pub:' in result.stdout:
+        logger.info('GPG key for %s already exists, reusing', email)
+        return email
+
+    logger.info('Generating GPG key for %s <%s> …', name, email)
+    key_config = textwrap.dedent(f'''\
+        Key-Type: RSA
+        Key-Length: 4096
+        Name-Real: {name}
+        Name-Email: {email}
+        Expire-Date: 0
+        %no-protection
+        %commit
+    ''')
+
+    result = run_command(
+        ['gpg', '--batch', '--generate-key'],
+        stdin_data=key_config,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+
+    logger.info('Generated GPG key for %s <%s>', name, email)
+    return email
+
+
+def _auto_detect_repo_structure(
+    output_dir: Path,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Inspect an existing repository and return (dists, components, archs).
+
+    Used by ``--sign-only`` to avoid requiring the user to re-specify
+    structural parameters that are already encoded on disk.
+    """
+    dists: List[str] = []
+    components: Set[str] = set()
+    architectures: Set[str] = set()
+
+    dists_dir = output_dir / 'dists'
+    if dists_dir.is_dir():
+        for dist_entry in sorted(dists_dir.iterdir()):
+            if not dist_entry.is_dir():
+                continue
+            dists.append(dist_entry.name)
+            for comp_entry in sorted(dist_entry.iterdir()):
+                if not comp_entry.is_dir():
+                    continue
+                components.add(comp_entry.name)
+                for arch_entry in sorted(comp_entry.iterdir()):
+                    if not arch_entry.is_dir():
+                        continue
+                    m = re.match(r'^binary-(.+)$', arch_entry.name)
+                    if m:
+                        architectures.add(m.group(1))
+
+    return (
+        dists or ['stable'],
+        sorted(components) or ['main'],
+        sorted(architectures) or ['amd64'],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Repository generation orchestrator
 # ---------------------------------------------------------------------------
 
 class RepositoryGenerator:
-    """Orchestrate the complete repository generation workflow."""
+    """Orchestrate the complete repository generation workflow.
+
+    Parameter groups:
+      *input_dirs, output_dir, dists, components, architectures*
+        Structural — what goes where.
+      *default_component, section_map*
+        Package→component routing.
+      *origin, label, description*
+        Free-form Release metadata.
+      *sign_key, no_sign, sign_only, generate_key, key_name, key_email*
+        GPG signing and key management.
+      *dry_run, force_full, use_apt, contents*
+        Operational toggles.
+      *trust_pool, quick, skip_validation*
+        Performance shortcuts (see AGENTS.md for interactions).
+    """
 
     def __init__(
         self,
@@ -954,9 +1064,27 @@ class RepositoryGenerator:
         trust_pool: bool = False,
         quick: bool = False,
         skip_validation: bool = False,
+        no_sign: bool = False,
+        sign_only: bool = False,
+        generate_key: bool = False,
+        key_name: str = 'APT Repository',
+        key_email: str = '',
     ) -> None:
-        self.input_dirs = input_dirs
         self.output_dir = output_dir.resolve()
+        state = RepoState(self.output_dir)
+        state.load()
+
+        # --sign-only auto-detects repo structure from disk
+        if sign_only:
+            dists, components, architectures = _auto_detect_repo_structure(
+                self.output_dir,
+            )
+            logger.info(
+                'Sign-only: auto-detected dists=%s, components=%s, archs=%s',
+                dists, components, architectures,
+            )
+
+        self.input_dirs = input_dirs
         self.dists = dists
         self.components = components
         self.architectures = architectures
@@ -973,8 +1101,20 @@ class RepositoryGenerator:
         self.trust_pool = trust_pool
         self.quick = quick
         self.skip_validation = skip_validation
+        self.no_sign = no_sign
+        self.sign_only = sign_only
+        self.generate_key = generate_key
+        self.key_name = key_name
+        self.key_email = key_email
 
-        self.state = RepoState(self.output_dir)
+        self.state = state
+
+        # Auto-detect signing key from previous runs
+        if self.sign_key is None and not self.no_sign:
+            persisted = self.state.data.get('sign_key')
+            if persisted:
+                logger.info('Reusing signing key from state: %s', persisted)
+                self.sign_key = persisted
 
         # Statistics
         self.stats: Dict[str, int] = {
@@ -1789,8 +1929,13 @@ class RepositoryGenerator:
         """Sign all Release files if a key was provided.
 
         When no signing key is configured, stale InRelease and Release.gpg
-        files from previous signed runs are removed.
+        files from previous signed runs are removed — unless ``--no-sign``
+        is active, in which case all existing signatures are left untouched.
         """
+        if self.no_sign:
+            logger.info('Signing skipped (--no-sign)')
+            return
+
         for dist in self.dists:
             release_path = self.output_dir / 'dists' / dist / 'Release'
             if not release_path.is_file():
@@ -1844,6 +1989,8 @@ class RepositoryGenerator:
         self.state.data['dists'] = self.dists
         self.state.data['components'] = self.components
         self.state.data['architectures'] = self.architectures
+        if self.sign_key:
+            self.state.data['sign_key'] = self.sign_key
         self.state.save(complete=True)
         logger.info('State saved to %s', self.state._state_file)
 
@@ -2093,6 +2240,17 @@ class RepositoryGenerator:
 
         Returns exit code (0 = success).
         """
+        if self.sign_only:
+            return self._run_sign_only()
+
+        # Optional key generation (before scanning, in case scan depends on it)
+        if self.generate_key and self.key_email:
+            try:
+                self.sign_key = _generate_gpg_key(self.key_name, self.key_email)
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                logger.error('GPG key generation failed: %s', exc)
+                return EXIT_GPG_ERROR
+
         # Load previous state
         self.state.load()
 
@@ -2123,7 +2281,8 @@ class RepositoryGenerator:
         # Phase 2: plan
         to_add, to_remove, unchanged = self.plan_changes(current)
 
-        if not to_add and not to_remove and not self.force_full:
+        no_changes = not to_add and not to_remove and not self.force_full
+        if no_changes:
             logger.info('No package changes detected')
 
         # Write in-progress marker before any modifications
@@ -2148,22 +2307,25 @@ class RepositoryGenerator:
         # Phase 4: generate Packages
         self.generate_packages(current, to_add, to_remove, unchanged)
 
-        # Phase 5: generate Release
-        self.generate_releases()
+        # Phase 5: generate Release  (skip when nothing changed)
+        if not no_changes or self.force_full:
+            self.generate_releases()
 
-        # Clean up apt-ftparchive cache directories
-        if not self.dry_run:
-            for dist in self.dists:
-                cache_dir = self.output_dir / 'dists' / dist / '.apt-cache'
-                if cache_dir.exists():
-                    shutil.rmtree(cache_dir)
-                    logger.debug('Cleaned apt cache: %s', cache_dir)
+            # Clean up apt-ftparchive cache directories
+            if not self.dry_run:
+                for dist in self.dists:
+                    cache_dir = self.output_dir / 'dists' / dist / '.apt-cache'
+                    if cache_dir.exists():
+                        shutil.rmtree(cache_dir)
+                        logger.debug('Cleaned apt cache: %s', cache_dir)
 
-        # Phase 6: sign (optional)
-        try:
-            self.sign_releases()
-        except subprocess.CalledProcessError:
-            return EXIT_GPG_ERROR
+            # Phase 6: sign (optional)
+            try:
+                self.sign_releases()
+            except subprocess.CalledProcessError:
+                return EXIT_GPG_ERROR
+        else:
+            logger.info('No package changes — skipping Release and signing')
 
         # Phase 7: cleanup stale metadata
         if not self.quick:
@@ -2195,6 +2357,72 @@ class RepositoryGenerator:
             logger.info('Validation skipped (--skip-validation)')
 
         logger.info('Done — repository at %s', self.output_dir)
+        return EXIT_SUCCESS
+
+    def _run_sign_only(self) -> int:
+        """Sign-only mode: (re)sign Release files of an existing repository.
+
+        Skips all package scanning, pool population, Packages generation,
+        and validation.  Only regenerates Release files (to ensure fresh
+        checksums) and signs them.
+        """
+        # Load state (needed for sign_key persistence)
+        self.state.load()
+
+        # Optional key generation
+        if self.generate_key and self.key_email:
+            try:
+                self.sign_key = _generate_gpg_key(self.key_name, self.key_email)
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                logger.error('GPG key generation failed: %s', exc)
+                return EXIT_GPG_ERROR
+
+        if not self.sign_key:
+            logger.error(
+                'No signing key configured — use --sign-key, --generate-key, '
+                'or ensure a key was persisted from a previous run',
+            )
+            return EXIT_INVALID_ARGS
+
+        # Verify GPG is available
+        if not shutil.which('gpg'):
+            logger.error('GPG signing requested but gpg is not installed')
+            return EXIT_MISSING_DEPENDENCY
+
+        # Regenerate Release files (this walks existing Packages files
+        # to compute fresh checksums)
+        logger.info(
+            'Sign-only: regenerating Release files for dists=%s',
+            self.dists,
+        )
+        self.generate_releases()
+
+        # Clean apt cache
+        if not self.dry_run:
+            for dist in self.dists:
+                cache_dir = self.output_dir / 'dists' / dist / '.apt-cache'
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+                    logger.debug('Cleaned apt cache: %s', cache_dir)
+
+        # Sign
+        try:
+            self.sign_releases()
+        except subprocess.CalledProcessError:
+            return EXIT_GPG_ERROR
+
+        # Persist sign_key in state (no package data to save)
+        if not self.dry_run:
+            self.state.data.setdefault('packages', {})
+            self.state.data['dists'] = self.dists
+            self.state.data['components'] = self.components
+            self.state.data['architectures'] = self.architectures
+            if self.sign_key:
+                self.state.data['sign_key'] = self.sign_key
+            self.state.save(complete=True)
+            logger.info('State saved to %s', self.state._state_file)
+
+        logger.info('Sign-only complete — repository at %s', self.output_dir)
         return EXIT_SUCCESS
 
 
@@ -2245,7 +2473,7 @@ def build_parser() -> argparse.ArgumentParser:
         '-i', '--input',
         action='append',
         dest='input_dirs',
-        required=True,
+        default=[],
         metavar='PATH',
         help='Input directory or .deb file (can be specified multiple times)',
     )
@@ -2259,7 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Repository structure
     parser.add_argument(
         '--dists',
-        required=True,
+        default='',
         metavar='LIST',
         help='Comma-separated distribution codenames (e.g. focal,jammy,noble)',
     )
@@ -2319,7 +2547,33 @@ def build_parser() -> argparse.ArgumentParser:
         '--sign-key',
         default=None,
         metavar='KEYID',
-        help='GPG key ID/email/fingerprint for signing Release files',
+        help='GPG key ID/email/fingerprint for signing Release files '
+             '(persisted to state for subsequent runs)',
+    )
+    parser.add_argument(
+        '--no-sign',
+        action='store_true',
+        dest='no_sign',
+        help='Skip all GPG operations — do not sign, do not remove stale '
+             'signatures (existing InRelease/Release.gpg files are left as-is)',
+    )
+    parser.add_argument(
+        '--generate-key',
+        action='store_true',
+        dest='generate_key',
+        help='Generate a new GPG key pair for signing (RSA 4096, no passphrase)',
+    )
+    parser.add_argument(
+        '--key-name',
+        default='APT Repository',
+        metavar='NAME',
+        help='Real name for auto-generated GPG key (default: "APT Repository")',
+    )
+    parser.add_argument(
+        '--key-email',
+        default='',
+        metavar='EMAIL',
+        help='Email for auto-generated GPG key (required with --generate-key)',
     )
 
     # Contents indices
@@ -2371,6 +2625,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest='no_apt',
         help='Disable apt-ftparchive; use pure-Python fallback',
     )
+    parser.add_argument(
+        '--sign-only',
+        action='store_true',
+        dest='sign_only',
+        help='Only (re)sign an existing repository — skips package scanning, '
+             'pool population, Packages generation, and validation. '
+             'Auto-detects dists/components/archs from the output directory. '
+             'Combine with --generate-key for first-time key creation.',
+    )
 
     # Logging
     parser.add_argument(
@@ -2406,41 +2669,65 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Entry point."""
+    """Entry point — parse args, validate, wire up RepositoryGenerator, run."""
     parser = build_parser()
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
+    # -- Validate argument combinations -----------------------------------
+    # Contradictory GPG modes
+    if args.sign_only and args.no_sign:
+        logger.error('--sign-only and --no-sign are mutually exclusive')
+        sys.exit(EXIT_INVALID_ARGS)
+    if args.no_sign and args.sign_key:
+        logger.error('--no-sign and --sign-key are mutually exclusive')
+        sys.exit(EXIT_INVALID_ARGS)
+    if args.generate_key and not args.key_email:
+        logger.error('--generate-key requires --key-email')
+        sys.exit(EXIT_INVALID_ARGS)
+    if args.no_sign and args.generate_key:
+        logger.error('--no-sign and --generate-key are mutually exclusive')
+        sys.exit(EXIT_INVALID_ARGS)
+
+    # Validate required arguments based on mode
+    if not args.sign_only and not args.input_dirs:
+        logger.error('--input/-i is required (unless --sign-only is used)')
+        sys.exit(EXIT_INVALID_ARGS)
+    if not args.sign_only and not args.dists:
+        logger.error('--dists is required (unless --sign-only is used)')
+        sys.exit(EXIT_INVALID_ARGS)
+
     # Parse comma-separated lists
-    dists = [d.strip() for d in args.dists.split(',') if d.strip()]
+    dists = [d.strip() for d in args.dists.split(',') if d.strip()] if args.dists else []
     components = [c.strip() for c in args.components.split(',') if c.strip()]
     architectures = [a.strip() for a in args.architectures.split(',') if a.strip()]
-    # Validate that input paths exist (directories or .deb files)
-    input_dirs = [Path(d).resolve() for d in args.input_dirs]
-    missing = []
-    for p in input_dirs:
-        if not p.exists():
-            missing.append(p)
-        elif p.is_file() and p.suffix != '.deb':
-            logger.error('Input file is not a .deb: %s', p)
-            sys.exit(EXIT_INVALID_ARGS)
-    if missing:
-        for d in missing:
-            logger.error('Input path not found: %s', d)
-        sys.exit(EXIT_INPUT_NOT_FOUND)
+
+    # Validate input paths (skip for --sign-only)
+    input_dirs: List[Path] = []
+    if args.input_dirs:
+        for raw in args.input_dirs:
+            p = Path(raw).resolve()
+            if not p.exists():
+                logger.error('Input path not found: %s', p)
+                sys.exit(EXIT_INPUT_NOT_FOUND)
+            if p.is_file() and p.suffix != '.deb':
+                logger.error('Input file is not a .deb: %s', p)
+                sys.exit(EXIT_INVALID_ARGS)
+            input_dirs.append(p)
 
     output_dir = Path(args.output).resolve()
 
-    if not dists:
-        logger.error('At least one distribution must be specified')
-        sys.exit(EXIT_INVALID_ARGS)
-    if not components:
-        logger.error('At least one component must be specified')
-        sys.exit(EXIT_INVALID_ARGS)
-    if not architectures:
-        logger.error('At least one architecture must be specified')
-        sys.exit(EXIT_INVALID_ARGS)
+    if not args.sign_only:
+        if not dists:
+            logger.error('At least one distribution must be specified')
+            sys.exit(EXIT_INVALID_ARGS)
+        if not components:
+            logger.error('At least one component must be specified')
+            sys.exit(EXIT_INVALID_ARGS)
+        if not architectures:
+            logger.error('At least one architecture must be specified')
+            sys.exit(EXIT_INVALID_ARGS)
 
     # Parse section map
     section_map: Dict[str, str] = {}
@@ -2469,19 +2756,20 @@ def main() -> None:
         logger.info('--quick mode: trust-pool=%s, skip-validation=%s, '
                     'incremental Packages patching enabled',
                     trust_pool, skip_validation)
-        # In quick mode, always use pure-Python generation (no apt-ftparchive)
-        # since patching is done via _patch_packages_file, not apt-ftparchive.
-        # apt-ftparchive always does a full scan which defeats the purpose.
         if use_apt:
             use_apt = False
             logger.info('--quick mode: forcing pure-Python (apt-ftparchive '
                         'does not support incremental patching)')
 
-    # Check GPG if signing requested
-    if args.sign_key:
-        if not shutil.which('gpg'):
-            logger.error('GPG signing requested but gpg is not installed')
-            sys.exit(EXIT_MISSING_DEPENDENCY)
+    # Check GPG if signing is needed (not --no-sign, and either explicit key,
+    # persisted key in state, or key generation requested)
+    needs_gpg = (
+        not args.no_sign
+        and (args.sign_key or args.generate_key or args.sign_only)
+    )
+    if needs_gpg and not shutil.which('gpg'):
+        logger.error('GPG operations requested but gpg is not installed')
+        sys.exit(EXIT_MISSING_DEPENDENCY)
 
     # Handle signals gracefully
     def _signal_handler(signum: int, _frame: Any) -> None:
@@ -2511,6 +2799,11 @@ def main() -> None:
         trust_pool=trust_pool,
         quick=args.quick,
         skip_validation=skip_validation,
+        no_sign=args.no_sign,
+        sign_only=args.sign_only,
+        generate_key=args.generate_key,
+        key_name=args.key_name,
+        key_email=args.key_email,
     )
 
     try:
