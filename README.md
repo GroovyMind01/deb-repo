@@ -71,11 +71,7 @@ deb-repo-gen -i <path> -o <output-dir> --dists <codenames> [options]
 |--------------------------|--------------------------------------------------------------|
 | `--archs`                | Comma-separated architectures (default: `amd64`)             |
 | `--components`           | Comma-separated components (default: `main`)                 |
-| `--default-component`    | Fallback component (default: `main`)                         |
 | `--section-map`          | JSON mapping Section prefixes → components                   |
-| `--origin`               | `Origin` field in Release files (default: `Custom Repository`)|
-| `--label`                | `Label` field in Release files (default: `Custom APT Repository`)|
-| `--description`          | `Description` field in Release files                         |
 | `--contents`             | Generate `Contents-<arch>.gz` file-to-package indices        |
 | `--sign-key`             | GPG key ID/email/fingerprint for signing. Persisted to state — only needed once. |
 | `--sign-only`            | Only (re)sign an existing repo — skips scanning, pool population, and validation |
@@ -218,12 +214,10 @@ deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy \
 lookups) by running `dpkg-deb -c` on every package. This is
 significantly slower — avoid unless needed.
 
-### Full — custom metadata and section mapping
+### Full — section mapping
 
 ```bash
 deb-repo-gen -i /all-debs/ -o /srv/apt-repo --dists jammy \
-    --origin "MyCompany" --label "Internal APT" \
-    --description "Internal packages for jammy" \
     --section-map '{"non-free/": "restricted", "contrib/": "multiverse"}'
 ```
 

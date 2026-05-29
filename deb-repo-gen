@@ -2543,40 +2543,12 @@ def build_parser() -> argparse.ArgumentParser:
         help='Comma-separated architectures (default: amd64)',
     )
 
-    # Component mapping
-    parser.add_argument(
-        '--default-component',
-        default='main',
-        metavar='COMPONENT',
-        help='Default component for packages (default: main)',
-    )
     parser.add_argument(
         '--section-map',
         default=None,
         metavar='JSON',
         help='JSON object mapping Section prefixes to components '
              '(e.g. \'{"non-free/":"restricted"}\')',
-    )
-
-    # Repository metadata
-    parser.add_argument(
-        '--origin',
-        default='Custom Repository',
-        metavar='NAME',
-        help='Origin field for Release files (default: "Custom Repository")',
-    )
-    parser.add_argument(
-        '--label',
-        default='Custom APT Repository',
-        metavar='NAME',
-        help='Label field for Release files (default: "Custom APT Repository")',
-    )
-    parser.add_argument(
-        '--description',
-        default=None,
-        metavar='TEXT',
-        help='Description field for Release files '
-             '(default: "Custom package repository for <dist>")',
     )
 
     # Signing
@@ -2824,14 +2796,10 @@ def main() -> None:
         components=components,
         architectures=architectures,
         sign_key=args.sign_key,
-        default_component=args.default_component,
         section_map=section_map,
         dry_run=args.dry_run,
         force_full=args.force_full,
         use_apt=use_apt,
-        origin=args.origin,
-        label=args.label,
-        description=args.description,
         generate_contents=args.contents,
         trust_pool=trust_pool,
         quick=args.quick,
